@@ -1,9 +1,65 @@
 """Physiology model wrapper."""
 from __future__ import annotations
 
+from enum import Enum
 import numpy as np
 
 from t1d_sim.behavior import ContextState
+
+
+class MealProfile(str, Enum):
+    """Meal absorption profile types."""
+
+    FAST = "fast"
+    MEDIUM = "medium"
+    SLOW = "slow"
+
+
+_MEAL_PROFILE_PARAMS: dict[MealProfile, tuple[int, float, float]] = {
+    MealProfile.FAST: (48, 0.22, 1.20),
+    MealProfile.MEDIUM: (72, 0.12, 1.00),
+    MealProfile.SLOW: (96, 0.075, 0.85),
+}
+
+
+def _meal_absorption_kernel(profile: MealProfile) -> np.ndarray:
+    """Dual-exponential meal absorption kernel in 5-min bins."""
+    length, decay, gain = _MEAL_PROFILE_PARAMS[profile]
+    t = np.arange(length, dtype=float)
+    # Difference of exponentials: fast gastric emptying vs slower elimination tail.
+    gastric = np.exp(-t * decay * 0.55)
+    elimination = np.exp(-t * decay * 1.35)
+    kernel = np.maximum(0.0, (gastric - elimination) * gain)
+    kernel_sum = float(kernel.sum())
+    if kernel_sum <= 0.0:
+        return np.zeros(length, dtype=float)
+    return kernel / kernel_sum
+
+
+_MEAL_KERNELS: dict[MealProfile, np.ndarray] = {
+    profile: _meal_absorption_kernel(profile) for profile in MealProfile
+}
+
+
+def _parse_meal_event(meal: tuple, rng: np.random.Generator) -> tuple:
+    """Normalize meal event tuple as (time, carbs, profile)."""
+    if len(meal) == 2:
+        t, carbs = meal
+        profile = MealProfile.MEDIUM
+    else:
+        t, carbs, raw_profile = meal[:3]
+        if raw_profile is None:
+            profile = MealProfile.MEDIUM
+        elif isinstance(raw_profile, MealProfile):
+            profile = raw_profile
+        elif str(raw_profile) == "grazer":
+            profile = rng.choice(
+                [MealProfile.FAST, MealProfile.MEDIUM, MealProfile.SLOW],
+                p=[0.30, 0.45, 0.25],
+            )
+        else:
+            profile = MealProfile(str(raw_profile).lower())
+    return t, float(carbs), profile
 
 
 def apply_context_effectors(base_params: dict, ctx: ContextState) -> dict:
@@ -76,12 +132,14 @@ def simulate_day_cgm(base_params: dict, modified_params: dict, meals: list[tuple
     bg = np.zeros(288, dtype=float)
     bg[0] = 120.0 + rng.normal(0, 8)
     meal_effect = np.zeros(288)
-    for t, carbs in meals:
+    for meal in meals:
+        t, carbs, profile = _parse_meal_event(meal, rng)
         idx = int((t.hour * 60 + t.minute) / 5)
-        for k in range(36):
-            j = idx + k
-            if j < 288:
-                meal_effect[j] += carbs * np.exp(-k / 8.0) * 0.8
+        kernel = _MEAL_KERNELS[profile]
+        end = min(288, idx + kernel.size)
+        window = end - idx
+        if window > 0:
+            meal_effect[idx:end] += carbs * kernel[:window] * 9.0
     sens = modified_params["k1"] / max(1e-6, base_params["k1"])
     egp = modified_params["EGP0"] / max(1e-6, base_params["EGP0"])
     for i in range(1, 288):
