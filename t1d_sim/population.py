@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
+import copy
 import numpy as np
 
 from t1d_sim.constants import PERSONAS
@@ -40,6 +41,7 @@ class PatientConfig:
     seed: int
     n_days: int
     split: str
+    uses_aid: bool = False
 
     @property
     def logging_quality(self) -> str:
@@ -55,7 +57,7 @@ class PatientConfig:
         return d
 
 
-def sample_population(n_patients: int, seed: int = 42, male_fraction: float = 0.45) -> list[PatientConfig]:
+def sample_population(n_patients: int, seed: int = 42, male_fraction: float = 0.45, aid_fraction: float = 0.35) -> list[PatientConfig]:
     """Sample synthetic patient configurations."""
     rng = np.random.default_rng(seed)
     personas = list(PERSONAS.keys())
@@ -73,14 +75,17 @@ def sample_population(n_patients: int, seed: int = 42, male_fraction: float = 0.
         weights /= weights.sum()
         persona_name = str(rng.choice(p_names, p=weights))
         persona = PERSONAS[persona_name]
-        patients.append(PatientConfig(
+        cfg = PatientConfig(
             patient_id=f"sim_{'f' if is_female else 'm'}_{i:03d}",
             persona=persona_name,
             is_female=is_female,
             activity_propensity=trait(persona, "activity_propensity"),
             sleep_regularity=trait(persona, "sleep_regularity"),
-            sleep_total_min_mean=float(np.clip(rng.normal(*persona.get("sleep_total_min_mean", (420, 45))), 240, 570)),
-            sleep_efficiency=float(np.clip(rng.normal(*persona.get("sleep_efficiency", (0.84, 0.07))), 0.55, 0.97)),
+            # Research: T1D actigraphy mean 358±48 min; cross-sectional mean ~440 min
+            # Only 50.3% of T1D adults meet 7-9h NSF target. Default reflects real population.
+            sleep_total_min_mean=float(np.clip(rng.normal(*persona.get("sleep_total_min_mean", (400, 65))), 240, 570)),
+            # Research: 40-63% of T1D adults are "bad sleepers" (PSQI>5). Pop mean ~0.82 not 0.84.
+            sleep_efficiency=float(np.clip(rng.normal(*persona.get("sleep_efficiency", (0.82, 0.10))), 0.55, 0.97)),
             sleep_schedule_offset_h=float(rng.normal(*persona.get("sleep_schedule_offset_h", (0.0, 0.3)))),
             stress_reactivity=trait(persona, "stress_reactivity"),
             stress_baseline=trait(persona, "stress_baseline") if "stress_baseline" in persona else float(np.clip(rng.normal(0.15, 0.10), 0, 0.6)),
@@ -105,5 +110,57 @@ def sample_population(n_patients: int, seed: int = 42, male_fraction: float = 0.
             seed=int(rng.integers(0, 1_000_000)),
             n_days=180,
             split="train",
-        ))
+        )
+        cfg.uses_aid = rng.random() < aid_fraction
+        cfg = apply_cross_parameter_interactions(cfg)
+        patients.append(cfg)
     return patients
+
+
+def apply_cross_parameter_interactions(config: PatientConfig) -> PatientConfig:
+    """Apply research-documented cross-trait interactions.
+
+    Research basis:
+    - Low mood_stability degrades meal_regularity and activity_propensity
+      (diabetes distress → behavioural entropy; 40% T1D chronic fatigue rate)
+    - Sleep irregularity causes eating jetlag (β=0.285, p=0.023 for wake-to-meal lag)
+    - High stress reactivity degrades sleep (bidirectional cortisol loop)
+    - High activity improves mood and sleep (CAN protective: OR=0.131)
+    - AID users: fewer sleep interruptions, higher activity, better mood
+    """
+    c = copy.deepcopy(config)
+
+    # Mood stability degrading meal regularity and activity
+    if c.mood_stability < 0.5:
+        deficit = 0.5 - c.mood_stability
+        c.meal_regularity = float(np.clip(c.meal_regularity * (1.0 - 0.25 * deficit), 0, 1))
+        c.activity_propensity = float(np.clip(c.activity_propensity * (1.0 - 0.30 * deficit), 0, 1))
+        c.logging_quality_raw = float(np.clip(c.logging_quality_raw - 0.10 * deficit, 0, 1))
+
+    # Sleep irregularity → eating jetlag
+    if c.sleep_regularity < 0.6:
+        deficit = 0.6 - c.sleep_regularity
+        c.meal_regularity = float(np.clip(c.meal_regularity * (1.0 - 0.20 * deficit), 0, 1))
+        c.stress_reactivity = float(np.clip(c.stress_reactivity + 0.08 * deficit, 0, 1))
+
+    # High stress → degrades sleep
+    if c.stress_reactivity > 0.6:
+        excess = c.stress_reactivity - 0.6
+        c.sleep_regularity = float(np.clip(c.sleep_regularity - 0.15 * excess, 0.1, 1))
+        c.sleep_total_min_mean = float(np.clip(c.sleep_total_min_mean - 20 * excess, 240, 570))
+        c.sleep_efficiency = float(np.clip(c.sleep_efficiency - 0.08 * excess, 0.55, 0.97))
+
+    # High activity → improves mood, sleep, lowers stress reactivity
+    if c.activity_propensity > 0.65:
+        boost = c.activity_propensity - 0.65
+        c.mood_stability = float(np.clip(c.mood_stability + 0.12 * boost, 0, 1))
+        c.sleep_efficiency = float(np.clip(c.sleep_efficiency + 0.06 * boost, 0.55, 0.97))
+        c.stress_reactivity = float(np.clip(c.stress_reactivity - 0.10 * boost, 0, 1))
+
+    # AID technology tier
+    if c.uses_aid:
+        c.sleep_efficiency = float(np.clip(c.sleep_efficiency + 0.04, 0.55, 0.97))
+        c.activity_propensity = float(np.clip(c.activity_propensity + 0.08, 0, 1))
+        c.mood_stability = float(np.clip(c.mood_stability + 0.06, 0, 1))
+
+    return c

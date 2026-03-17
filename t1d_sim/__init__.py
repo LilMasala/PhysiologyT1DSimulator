@@ -16,9 +16,9 @@ def _simulate_one(args: tuple[PatientConfig, int, datetime]) -> dict:
     return simulate_patient(*args)
 
 
-def simulate_population(outdb: str | None = None, firebase_project: str | None = None, outdir: str = "./t1d_sim_output/", n_patients: int = 100, days: int = 180, seed: int = 42, split: str = "80/10/10", jobs: int = 1, male_fraction: float = 0.45) -> None:
+def simulate_population(outdb: str | None = None, firebase_project: str | None = None, outdir: str = "./t1d_sim_output/", n_patients: int = 100, days: int = 180, seed: int = 42, split: str = "80/10/10", jobs: int = 1, male_fraction: float = 0.45, aid_fraction: float = 0.35) -> None:
     """Run full population simulation."""
-    patients = sample_population(n_patients, seed=seed, male_fraction=male_fraction)
+    patients = sample_population(n_patients, seed=seed, male_fraction=male_fraction, aid_fraction=aid_fraction)
     train, val, test = [int(x) for x in split.split("/")]
     cuts = [n_patients * train // 100, n_patients * (train + val) // 100]
     for i, p in enumerate(patients):
