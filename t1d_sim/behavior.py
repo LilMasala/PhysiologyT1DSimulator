@@ -62,7 +62,7 @@ def generate_day_behavior(cfg: PatientConfig, start_day: datetime, day_index: in
 
     n_meals = int(np.clip(round(rng.normal(cfg.n_meals_per_day_mean, 0.8)), 1, 6))
     windows = [(8, (30, 60), cfg.skips_breakfast_p), (13, (40, 80), cfg.skips_lunch_p), (19, (50, 90), 0.05)]
-    meals: list[tuple[datetime, float]] = []
+    meals: list[tuple[datetime, float, str | None]] = []
     for h, (low, high), skip_p in windows:
         if rng.random() < skip_p + 0.15 * stress:
             continue
@@ -70,11 +70,13 @@ def generate_day_behavior(cfg: PatientConfig, start_day: datetime, day_index: in
         hh = h + cfg.meal_schedule_offset_h + (0.7 if (is_weekend and h == 8) else 0)
         t = start_day + timedelta(hours=float(rng.normal(hh, minute_std / 60)), minutes=float(rng.normal(0, minute_std)))
         carb = float(rng.uniform(low, high) * cfg.meal_size_multiplier * (1.0 + (cfg.luteal_meal_size_boost if phase == "luteal" else 0.0)))
-        meals.append((t, carb))
+        profile_tag = "grazer" if cfg.persona == "grazer" else None
+        meals.append((t, carb, profile_tag))
     while len(meals) < n_meals:
         h = float(rng.uniform(10, 22))
         t = start_day + timedelta(hours=h)
-        meals.append((t, float(rng.uniform(10, 30) * cfg.meal_size_multiplier)))
+        profile_tag = "grazer" if cfg.persona == "grazer" else None
+        meals.append((t, float(rng.uniform(10, 30) * cfg.meal_size_multiplier), profile_tag))
 
     site_days = max(0, int(np.floor((day_index % 12) / 3)))
     site_loc = SITE_LOCATIONS[(day_index // 3) % len(SITE_LOCATIONS)]
