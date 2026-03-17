@@ -18,6 +18,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--split", default="80/10/10")
     p.add_argument("--jobs", type=int, default=1)
     p.add_argument("--male_fraction", type=float, default=0.45)
+    p.add_argument("--aid_fraction", type=float, default=0.35,
+        help="Fraction of population using AID systems (default 0.35)")
     return p
 
 
@@ -36,6 +38,7 @@ def main() -> None:
         split=args.split,
         jobs=args.jobs,
         male_fraction=args.male_fraction,
+        aid_fraction=args.aid_fraction,
     )
 
 
