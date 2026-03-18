@@ -21,7 +21,92 @@ CREATE TABLE IF NOT EXISTS therapy_settings_hourly (user_id TEXT, hour_utc TEXT,
 CREATE TABLE IF NOT EXISTS mood_hourly (user_id TEXT, hour_utc TEXT, valence REAL, arousal REAL, quad_pos_pos INTEGER, quad_pos_neg INTEGER, quad_neg_pos INTEGER, quad_neg_neg INTEGER, hours_since_mood REAL, PRIMARY KEY (user_id, hour_utc));
 CREATE TABLE IF NOT EXISTS mood_events (user_id TEXT, event_id TEXT, timestamp_utc TEXT, valence REAL, arousal REAL, PRIMARY KEY (user_id, event_id));
 CREATE TABLE IF NOT EXISTS feature_frames (user_id TEXT, hour_utc TEXT, bg_avg REAL, bg_tir REAL, bg_percent_low REAL, bg_percent_high REAL, bg_uroc REAL, bg_delta_avg_7h REAL, bg_z_avg_7h REAL, hr_mean REAL, hr_delta_7h REAL, hr_z_7h REAL, rhr_daily REAL, kcal_active REAL, kcal_active_last3h REAL, kcal_active_last6h REAL, kcal_active_delta_7h REAL, kcal_active_z_7h REAL, sleep_prev_total_min REAL, sleep_debt_7d_min REAL, minutes_since_wake INTEGER, ex_move_min REAL, ex_exercise_min REAL, ex_min_last3h REAL, ex_hours_since REAL, days_since_period_start INTEGER, cycle_follicular INTEGER, cycle_ovulation INTEGER, cycle_luteal INTEGER, days_since_site_change INTEGER, site_loc_current TEXT, site_loc_same_as_last INTEGER, mood_valence REAL, mood_arousal REAL, mood_quad_pos_pos INTEGER, mood_quad_pos_neg INTEGER, mood_quad_neg_pos INTEGER, mood_quad_neg_neg INTEGER, mood_hours_since REAL, PRIMARY KEY (user_id, hour_utc));
-CREATE TABLE IF NOT EXISTS ground_truth_daily (user_id TEXT, date_utc TEXT, true_isf REAL, true_cr REAL, true_basal REAL, true_meal_times TEXT, true_meal_carbs TEXT, true_exercise_min INTEGER, true_exercise_intensity REAL, true_sleep_min INTEGER, true_cycle_phase TEXT, true_mood_valence REAL, true_mood_arousal REAL, true_stress REAL, PRIMARY KEY (user_id, date_utc));
+CREATE TABLE IF NOT EXISTS ground_truth_daily (user_id TEXT, date_utc TEXT, true_isf REAL, true_cr REAL, true_basal REAL, true_meal_times TEXT, true_meal_carbs TEXT, true_exercise_min INTEGER, true_exercise_intensity REAL, true_sleep_min INTEGER, true_cycle_phase TEXT, true_mood_valence REAL, true_mood_arousal REAL, true_stress REAL, phase INTEGER DEFAULT 0, path_id TEXT DEFAULT '', effective_isf REAL, effective_fitness REAL, active_events TEXT, PRIMARY KEY (user_id, date_utc, path_id));
+
+-- Chamelia Block 5: Shadow records
+CREATE TABLE IF NOT EXISTS shadow_records (
+    record_id TEXT PRIMARY KEY,
+    patient_id TEXT,
+    day_index INTEGER,
+    timestamp_utc TEXT,
+    feature_snapshot TEXT,
+    proposed_action TEXT,
+    baseline_action TEXT,
+    proposed_predictions TEXT,
+    baseline_predictions TEXT,
+    gate_passed INTEGER,
+    gate_composite_score REAL,
+    gate_layer_scores TEXT,
+    gate_blocked_by TEXT,
+    familiarity_score REAL,
+    calibration_scores TEXT,
+    actual_outcomes TEXT,
+    actual_user_action TEXT,
+    actual_settings TEXT,
+    counterfactual_estimate TEXT,
+    per_model_accuracy TEXT,
+    shadow_score_delta REAL
+);
+
+-- Chamelia Block 6: Model registry
+CREATE TABLE IF NOT EXISTS model_registry (
+    model_id TEXT PRIMARY KEY,
+    version TEXT,
+    architecture TEXT,
+    target TEXT,
+    training_date TEXT,
+    data_window TEXT,
+    hyperparameters TEXT,
+    validation_metrics TEXT,
+    trust_weight REAL,
+    status TEXT DEFAULT 'active',
+    drift_sensitivity REAL DEFAULT 0.5,
+    regime_tags TEXT DEFAULT '[]'
+);
+
+-- Chamelia Block 5: Scorecard snapshots
+CREATE TABLE IF NOT EXISTS scorecard_snapshots (
+    timestamp_utc TEXT,
+    window_size INTEGER,
+    n_records INTEGER,
+    win_rate REAL,
+    safety_violations INTEGER,
+    coverage_80 REAL,
+    familiarity_rate REAL,
+    cross_context_spread REAL,
+    acceptance_rate REAL,
+    consecutive_pass_days INTEGER,
+    status TEXT
+);
+
+-- Chamelia Block 7: Recommendation log
+CREATE TABLE IF NOT EXISTS recommendation_log (
+    record_id TEXT PRIMARY KEY,
+    patient_id TEXT,
+    day_index INTEGER,
+    timestamp_utc TEXT,
+    decision TEXT,
+    proposed_isf REAL,
+    proposed_cr REAL,
+    proposed_basal REAL,
+    baseline_isf REAL,
+    baseline_cr REAL,
+    baseline_basal REAL,
+    predicted_tir REAL,
+    predicted_pct_low REAL,
+    confidence REAL,
+    reward REAL,
+    explanation TEXT
+);
+
+-- Chamelia Block 9: Evaluation snapshots
+CREATE TABLE IF NOT EXISTS evaluation_snapshots (
+    timestamp_utc TEXT,
+    method TEXT,
+    n_samples INTEGER,
+    metrics TEXT,
+    details TEXT
+);
 """
 
 
@@ -47,11 +132,65 @@ class SQLiteWriter(BaseWriter):
         c.executemany("INSERT OR REPLACE INTO therapy_settings_hourly VALUES (?,?,?,?,?,?,?)", payload["therapy"])
         c.executemany("INSERT OR REPLACE INTO mood_hourly VALUES (?,?,?,?,?,?,?,?,?)", payload["mood_hourly"])
         c.executemany("INSERT OR REPLACE INTO mood_events VALUES (?,?,?,?,?)", payload["mood_events"])
-        c.executemany("INSERT OR REPLACE INTO ground_truth_daily VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)", payload["ground_truth"])
+        # ground_truth_daily now has 19 columns (phase, path_id, effective_isf,
+        # effective_fitness, active_events).
+        gt = payload["ground_truth"]
+        if gt:
+            ncols = len(gt[0])
+            if ncols == 14:
+                # Legacy open-loop: append phase=0, path_id='', + 3 feedback cols.
+                gt = [(*r, 0, "", None, None, "[]") for r in gt]
+            elif ncols == 16:
+                # Pre-feedback: append 3 feedback cols.
+                gt = [(*r, None, None, "[]") for r in gt]
+        c.executemany(
+            "INSERT OR REPLACE INTO ground_truth_daily VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            gt,
+        )
         self.conn.commit()
 
     def write_features(self, rows: list[tuple]) -> None:
         self.conn.executemany("INSERT OR REPLACE INTO feature_frames VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)", rows)
+        self.conn.commit()
+
+    def write_shadow_records(self, records: list[tuple]) -> None:
+        """Write shadow records from Block 5."""
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO shadow_records VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            records,
+        )
+        self.conn.commit()
+
+    def write_model_registry(self, entries: list[tuple]) -> None:
+        """Write model registry entries from Block 6."""
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO model_registry VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+            entries,
+        )
+        self.conn.commit()
+
+    def write_scorecard_snapshot(self, row: tuple) -> None:
+        """Write a scorecard snapshot from Block 5."""
+        self.conn.execute(
+            "INSERT INTO scorecard_snapshots VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            row,
+        )
+        self.conn.commit()
+
+    def write_recommendation_log(self, rows: list[tuple]) -> None:
+        """Write recommendation log entries from Block 7."""
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO recommendation_log VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        self.conn.commit()
+
+    def write_evaluation_snapshot(self, row: tuple) -> None:
+        """Write an evaluation snapshot from Block 9."""
+        self.conn.execute(
+            "INSERT INTO evaluation_snapshots VALUES (?,?,?,?,?)",
+            row,
+        )
         self.conn.commit()
 
     def raw_for_features(self):

@@ -2,9 +2,13 @@
 from __future__ import annotations
 
 from enum import Enum
+from typing import TYPE_CHECKING
 import numpy as np
 
 from t1d_sim.behavior import ContextState
+
+if TYPE_CHECKING:
+    from t1d_sim.feedback import PatientState
 
 
 class MealProfile(str, Enum):
@@ -53,18 +57,39 @@ def _parse_meal_event(meal: tuple, rng: np.random.Generator) -> tuple:
         elif isinstance(raw_profile, MealProfile):
             profile = raw_profile
         elif str(raw_profile) == "grazer":
-            profile = rng.choice(
-                [MealProfile.FAST, MealProfile.MEDIUM, MealProfile.SLOW],
+            profile = MealProfile(rng.choice(
+                ["fast", "medium", "slow"],
                 p=[0.30, 0.45, 0.25],
-            )
+            ))
         else:
             profile = MealProfile(str(raw_profile).lower())
     return t, float(carbs), profile
 
 
-def apply_context_effectors(base_params: dict, ctx: ContextState) -> dict:
-    """Apply context-driven parameter modulation."""
+def apply_context_effectors(
+    base_params: dict,
+    ctx: ContextState,
+    patient_state: "PatientState | None" = None,
+    event_modifiers: dict | None = None,
+) -> dict:
+    """Apply context-driven parameter modulation.
+
+    Optional feedback parameters (backward-compatible, default None):
+        patient_state: drifted ISF/fitness from biweekly updates.
+        event_modifiers: dict from apply_event_modifiers() for life events.
+    """
     params = base_params.copy()
+    ev = event_modifiers or {}
+
+    # Note: drifted ISF from PatientState is injected via base_params["k1"/"k2"]
+    # by the caller (patient.py). Drifted stress_baseline reaches here through
+    # ctx.stress_baseline, set by behavior.py. So patient_state param is accepted
+    # for forward compatibility but doesn't modify params directly.
+
+    # ── Event-driven ISF modifier (medication, illness) ──
+    params["k1"] *= ev.get("isf_mult_factor", 1.0)
+    params["k2"] *= ev.get("isf_mult_factor", 1.0)
+
     if ctx.hours_since_exercise < 48:
         decay = np.exp(-ctx.hours_since_exercise / 16.0)
         max_boost = 0.40 * ctx.exercise_intensity
@@ -120,9 +145,15 @@ def apply_context_effectors(base_params: dict, ctx: ContextState) -> dict:
     if ctx.stress_baseline > 0.15:
         chronic = min(0.20, 0.15 * (ctx.stress_baseline - 0.15) * ctx.stress_reactivity)
         params["EGP0"] *= (1.0 + chronic)
-    if ctx.is_ill:
+
+    # ── Illness: event-driven EGP/ISF replaces binary check ──
+    if ev.get("is_ill_override", False):
+        params["EGP0"] *= ev.get("egp_mult", 1.40)
+        # ISF already applied via isf_mult_factor above
+    elif ctx.is_ill:
         params["EGP0"] *= 1.40
         params["k1"] *= 0.75
+
     return params
 
 
@@ -144,5 +175,5 @@ def simulate_day_cgm(base_params: dict, modified_params: dict, meals: list[tuple
     egp = modified_params["EGP0"] / max(1e-6, base_params["EGP0"])
     for i in range(1, 288):
         drift = (egp - 1.0) * 1.8 - (sens - 1.0) * 1.2
-        bg[i] = max(45.0, bg[i-1] + 0.06 * meal_effect[i] + drift + rng.normal(0, 2.8))
+        bg[i] = max(45.0, min(450.0, bg[i-1] + 0.06 * meal_effect[i] + drift + rng.normal(0, 2.8)))
     return bg
