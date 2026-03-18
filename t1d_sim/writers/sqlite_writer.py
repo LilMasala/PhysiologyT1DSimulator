@@ -107,6 +107,34 @@ CREATE TABLE IF NOT EXISTS evaluation_snapshots (
     metrics TEXT,
     details TEXT
 );
+
+-- Chamelia MVP simulation summaries
+CREATE TABLE IF NOT EXISTS patient_run_summary (
+    patient_id TEXT PRIMARY KEY,
+    final_phase INTEGER,
+    current_isf REAL,
+    current_cr REAL,
+    current_basal REAL,
+    days_observed INTEGER,
+    mean_tir REAL,
+    early_tir REAL,
+    late_tir REAL,
+    tir_delta REAL,
+    recommendations_surfaced INTEGER,
+    recommendations_accepted INTEGER,
+    acceptance_rate REAL,
+    graduated_to_intervention INTEGER,
+    entered_shadow INTEGER,
+    degraduation_count INTEGER,
+    burnout_flag INTEGER,
+    burnout_definition TEXT
+);
+
+CREATE TABLE IF NOT EXISTS simulation_runs (
+    run_id TEXT PRIMARY KEY,
+    created_at_utc TEXT,
+    summary_json TEXT
+);
 """
 
 
@@ -189,6 +217,22 @@ class SQLiteWriter(BaseWriter):
         """Write an evaluation snapshot from Block 9."""
         self.conn.execute(
             "INSERT INTO evaluation_snapshots VALUES (?,?,?,?,?)",
+            row,
+        )
+        self.conn.commit()
+
+    def write_patient_run_summary(self, rows: list[tuple]) -> None:
+        """Write MVP patient-level simulation summaries."""
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO patient_run_summary VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            rows,
+        )
+        self.conn.commit()
+
+    def write_simulation_run(self, row: tuple) -> None:
+        """Write the top-level simulation summary payload."""
+        self.conn.execute(
+            "INSERT OR REPLACE INTO simulation_runs VALUES (?,?,?)",
             row,
         )
         self.conn.commit()

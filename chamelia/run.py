@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import copy
+import json
 import pickle
 import sys
 import time
@@ -70,6 +71,7 @@ from t1d_sim.missingness import generate_day_missingness, menstrual_is_missing, 
 from t1d_sim.observation import observe_cgm, synthesize_energy, synthesize_hr
 from t1d_sim.physiology import apply_context_effectors, simulate_day_cgm
 from t1d_sim.population import PatientConfig, sample_population
+from t1d_sim.writers.sqlite_writer import SQLiteWriter
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +116,10 @@ class PatientRuntime:
 
     # Rolling history for feature extraction (last 7 days)
     feature_history: list[dict[str, float]] = field(default_factory=list)
+    tir_history: list[float] = field(default_factory=list)
+    burnout_days: list[int] = field(default_factory=list)
+    entered_shadow_day: int | None = None
+    reached_intervention: bool = False
 
     @classmethod
     def from_config(cls, cfg: PatientConfig) -> "PatientRuntime":
@@ -152,6 +158,7 @@ class WorldRunner:
         seed: int = 42,
         learning_mode: str = "hybrid",
         initial_zoo_path: str | None = None,
+        outdb_path: str | None = None,
         verbose: bool = True,
     ) -> None:
         self.n_patients = n_patients
@@ -160,6 +167,8 @@ class WorldRunner:
         self.learning_mode = learning_mode
         self.verbose = verbose
         self.rng = np.random.default_rng(seed)
+        self.outdb_path = outdb_path
+        self.writer = SQLiteWriter(outdb_path) if outdb_path else None
 
         # Meta-controller
         self.meta = MetaController(learning_mode=learning_mode)
@@ -189,6 +198,13 @@ class WorldRunner:
         self.graduation_count = 0
         self.degraduation_count = 0
         self.total_shadow_records = 0
+        self.recommendation_log_rows: list[tuple] = []
+        self.bucketed_tir_history: list[dict[str, Any]] = []
+        self.run_started_at = datetime.now(timezone.utc)
+        self._burnout_definition = (
+            "Patient counted as burned out after any day with mood_valence below "
+            "their personality.burnout_threshold."
+        )
 
     def _load_initial_zoo(self, path: str) -> None:
         """Load the initial model zoo from a pickle file."""
@@ -217,6 +233,32 @@ class WorldRunner:
         """Initialize the patient population."""
         configs = sample_population(self.n_patients, seed=self.seed)
         self.patients = [PatientRuntime.from_config(cfg) for cfg in configs]
+        if self.writer:
+            self.writer.conn.executemany(
+                "INSERT OR REPLACE INTO patients VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                [
+                    (
+                        cfg.patient_id,
+                        cfg.split,
+                        cfg.logging_quality,
+                        int(cfg.is_female),
+                        cfg.activity_propensity,
+                        cfg.sleep_regularity,
+                        cfg.stress_reactivity,
+                        cfg.cycle_sensitivity,
+                        cfg.mood_stability,
+                        cfg.meal_regularity,
+                        cfg.base_rhr,
+                        cfg.fitness_level,
+                        cfg.base_patient_name,
+                        cfg.isf_multiplier,
+                        cfg.cr_multiplier,
+                        cfg.basal_multiplier,
+                    )
+                    for cfg in configs
+                ],
+            )
+            self.writer.conn.commit()
         if self.verbose:
             print(f"[world] Initialized {len(self.patients)} patients")
 
@@ -290,7 +332,11 @@ class WorldRunner:
             if self.verbose and (day % 30 == 0 or day == self.n_days - 1):
                 self._print_status(day, population_win_rate, causal_delta)
 
-        return self._build_summary()
+        summary = self._build_summary()
+        self._persist_summary(summary)
+        if self.writer:
+            self.writer.finalize()
+        return summary
 
     # ------------------------------------------------------------------
     # Patient Simulation
@@ -356,6 +402,9 @@ class WorldRunner:
         outcome = compute_yesterday_outcome(true_bg, beh, pt.last_outcome)
         pt.last_outcome = outcome
         pt.drift_outcomes.append(outcome)
+        pt.tir_history.append(outcome.tir)
+        if pt.mood_valence < pt.personality.burnout_threshold:
+            pt.burnout_days.append(day)
 
         # Build daily feature snapshot and store in rolling history
         daily_feats = self._build_daily_features(pt, ctx, beh, outcome, true_bg, hr_arr, active_e)
@@ -582,6 +631,7 @@ class WorldRunner:
         # Phase 1: all records are "not_shown" — patient doesn't see them
         # Phase 2: determined below by user decision
         if pt.phase == 1:
+            self._flush_shadow_record(record)
             pt.shadow_mod.enrich_outcome(
                 record.record_id, actual_outcomes, "not_shown",
                 [pt.isf_mult, pt.cr_mult, pt.basal_mult],
@@ -590,6 +640,7 @@ class WorldRunner:
                 record.record_id,
                 per_model_accuracy=per_model_accuracy,
             )
+            self._flush_shadow_record(record)
             self.total_shadow_records += 1
             # Return proposed action for counterfactual simulation
             if is_different:
@@ -644,6 +695,8 @@ class WorldRunner:
                 record.record_id,
                 per_model_accuracy=per_model_accuracy,
             )
+            self._log_recommendation(pt, record, rec_pkg)
+            self._flush_shadow_record(record)
         else:
             # Budget empty or no recommendation — still log the record
             pt.shadow_mod.enrich_outcome(
@@ -654,6 +707,7 @@ class WorldRunner:
                 record.record_id,
                 per_model_accuracy=per_model_accuracy,
             )
+            self._flush_shadow_record(record)
 
         self.total_shadow_records += 1
         # Return proposed action for counterfactual simulation
@@ -974,6 +1028,37 @@ class WorldRunner:
 
         return result if result else None
 
+    def _flush_shadow_record(self, record: Any) -> None:
+        """Persist a shadow record immediately when a DB writer is active."""
+        if self.writer:
+            self.writer.write_shadow_records([record.to_row()])
+
+    def _log_recommendation(self, pt: PatientRuntime, record: Any, rec_pkg: Any) -> None:
+        """Persist surfaced recommendation rows for later inspection."""
+        if not self.writer:
+            return
+        primary = rec_pkg.primary
+        baseline = TherapyAction(*record.baseline_action)
+        row = (
+            record.record_id,
+            pt.cfg.patient_id,
+            record.day_index,
+            record.timestamp_utc,
+            rec_pkg.decision,
+            primary.isf_multiplier if primary else None,
+            primary.cr_multiplier if primary else None,
+            primary.basal_multiplier if primary else None,
+            baseline.isf_multiplier,
+            baseline.cr_multiplier,
+            baseline.basal_multiplier,
+            rec_pkg.primary_predicted_outcomes.get("tir"),
+            rec_pkg.primary_predicted_outcomes.get("percent_low"),
+            rec_pkg.primary_confidence,
+            rec_pkg.primary_reward,
+            rec_pkg.explanation,
+        )
+        self.writer.write_recommendation_log([row])
+
     # ------------------------------------------------------------------
     # Phase Transitions (Section 1.4)
     # ------------------------------------------------------------------
@@ -987,6 +1072,7 @@ class WorldRunner:
             if pt.phase == 0:
                 if has_active_model and day >= self.MIN_OBSERVATION_DAYS:
                     pt.phase = 1
+                    pt.entered_shadow_day = day
                     pt.therapy_mode.promote(day)  # Shadow → Suggest Values
 
             # Phase 1 → Phase 2: graduation conditions met
@@ -999,6 +1085,7 @@ class WorldRunner:
                 if graduated:
                     pt.phase = 2
                     pt.graduation_day = day
+                    pt.reached_intervention = True
                     self.graduation_count += 1
 
             # Phase 2 → Phase 1: de-graduation
@@ -1113,6 +1200,11 @@ class WorldRunner:
                 X_train, y_train,
                 X_val=X_val if len(X_val) > 10 else None,
                 y_val=y_val if len(X_val) > 10 else None,
+                xgb_params={
+                    "n_estimators": 80,
+                    "max_depth": 4,
+                    "learning_rate": 0.08,
+                },
             )
         except Exception as e:
             if self.verbose:
@@ -1135,6 +1227,8 @@ class WorldRunner:
         )
         self.meta.register_model(entry)
         self.meta.register_candidate(new_id, day)
+        if self.writer:
+            self.writer.write_model_registry([entry.to_row()])
 
         # If no active model exists (first train), promote immediately
         if self.active_model is None:
@@ -1142,6 +1236,8 @@ class WorldRunner:
             entry.status = "active"
             if hasattr(self.meta, '_state') and self.meta._state.candidate_model_id:
                 self.meta.promote_candidate()
+            if self.writer:
+                self.writer.write_model_registry([entry.to_row()])
             if self.verbose:
                 print(f"  [retrain] Day {day}: first model {new_id} trained on "
                       f"{len(X_train)} rows → promoted immediately")
@@ -1164,6 +1260,20 @@ class WorldRunner:
     ) -> None:
         """Run the full weekly meta-controller evaluation."""
         self.meta.weekly_evaluation(day, population_win_rate, causal_delta)
+        if self.writer:
+            self.writer.write_evaluation_snapshot(
+                (
+                    datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+                    "weekly_world_runner",
+                    len(self.patients),
+                    json.dumps({
+                        "day": day,
+                        "population_win_rate": population_win_rate,
+                        "causal_delta": causal_delta,
+                    }),
+                    json.dumps({"retrain_count": self.retrain_count}),
+                )
+            )
 
         # Check candidate validation
         if self.meta._state.candidate_model_id:
@@ -1238,9 +1348,76 @@ class WorldRunner:
             lvl = int(pt.therapy_mode.current_level)
             level_dist[lvl] = level_dist.get(lvl, 0) + 1
 
+        early_window = min(30, self.n_days)
+        late_start = max(0, self.n_days - 30)
+        early_tirs = []
+        late_tirs = []
+        patient_rows = []
+        for pt in self.patients:
+            early = float(np.mean(pt.tir_history[:early_window])) if pt.tir_history[:early_window] else None
+            late = float(np.mean(pt.tir_history[late_start:])) if pt.tir_history[late_start:] else None
+            mean_tir = float(np.mean(pt.tir_history)) if pt.tir_history else None
+            acceptance_rate = (
+                pt.n_recommendations_accepted / pt.n_recommendations_surfaced
+                if pt.n_recommendations_surfaced else None
+            )
+            tir_delta = (late - early) if early is not None and late is not None else None
+            if early is not None:
+                early_tirs.append(early)
+            if late is not None:
+                late_tirs.append(late)
+            patient_rows.append({
+                "patient_id": pt.cfg.patient_id,
+                "final_phase": pt.phase,
+                "current_isf": pt.isf_mult,
+                "current_cr": pt.cr_mult,
+                "current_basal": pt.basal_mult,
+                "days_observed": len(pt.tir_history),
+                "mean_tir": mean_tir,
+                "early_tir": early,
+                "late_tir": late,
+                "tir_delta": tir_delta,
+                "recommendations_surfaced": pt.n_recommendations_surfaced,
+                "recommendations_accepted": pt.n_recommendations_accepted,
+                "acceptance_rate": acceptance_rate,
+                "graduated_to_intervention": pt.reached_intervention,
+                "entered_shadow": pt.entered_shadow_day is not None,
+                "degraduation_count": pt.degraduation_count,
+                "burnout_flag": bool(pt.burnout_days),
+            })
+
+        bucket_size = 30
+        tir_buckets = []
+        for start in range(0, self.n_days, bucket_size):
+            bucket_vals = [
+                float(np.mean(pt.tir_history[start:start + bucket_size]))
+                for pt in self.patients
+                if pt.tir_history[start:start + bucket_size]
+            ]
+            if bucket_vals:
+                tir_buckets.append({
+                    "start_day": start + 1,
+                    "end_day": min(start + bucket_size, self.n_days),
+                    "mean_tir": float(np.mean(bucket_vals)),
+                })
+
+        mean_early = float(np.mean(early_tirs)) if early_tirs else 0.0
+        mean_late = float(np.mean(late_tirs)) if late_tirs else 0.0
+        tir_delta = mean_late - mean_early
+        acceptance_n = sum(pt.n_recommendations_accepted for pt in self.patients)
+        surfaced_n = sum(pt.n_recommendations_surfaced for pt in self.patients)
+        burnout_count = sum(1 for pt in self.patients if pt.burnout_days)
+        burnout_rate = burnout_count / max(len(self.patients), 1)
+        verdict = (
+            "Viable MVP baseline: mean TIR improved and burnout remained acceptable."
+            if tir_delta > 0 and burnout_rate <= 0.25
+            else "Needs follow-up: either TIR did not improve or burnout/disengagement exceeded the MVP guardrail."
+        )
+
         return {
             "n_patients": self.n_patients,
             "n_days": self.n_days,
+            "seed": self.seed,
             "learning_mode": self.learning_mode,
             "phase_distribution": phase_dist,
             "level_distribution": level_dist,
@@ -1250,11 +1427,81 @@ class WorldRunner:
             "total_shadow_records": self.total_shadow_records,
             "final_population_win_rate": self._compute_population_win_rate(),
             "final_causal_delta": self._compute_causal_delta(),
-            "burnout_count": sum(
-                1 for pt in self.patients
-                if pt.mood_valence < pt.personality.burnout_threshold
+            "burnout_count": burnout_count,
+            "burnout_definition": self._burnout_definition,
+            "burnout_rate": burnout_rate,
+            "mean_tir_early_window": mean_early,
+            "mean_tir_late_window": mean_late,
+            "overall_tir_delta": tir_delta,
+            "tir_by_30_day_bucket": tir_buckets,
+            "number_of_surfaced_recommendations": surfaced_n,
+            "recommendation_acceptance_rate": (
+                acceptance_n / surfaced_n if surfaced_n else 0.0
             ),
+            "patients_entering_shadow": sum(1 for pt in self.patients if pt.entered_shadow_day is not None),
+            "percent_entering_shadow": sum(1 for pt in self.patients if pt.entered_shadow_day is not None) / max(self.n_patients, 1),
+            "patients_graduating_to_intervention": sum(1 for pt in self.patients if pt.reached_intervention),
+            "percent_graduating_to_intervention": sum(1 for pt in self.patients if pt.reached_intervention) / max(self.n_patients, 1),
+            "did_mean_tir_improve": bool(tir_delta > 0),
+            "did_burnout_remain_acceptable": bool(burnout_rate <= 0.25),
+            "viability_verdict": verdict,
+            "patient_summaries": patient_rows,
         }
+
+    def _persist_summary(self, summary: dict[str, Any]) -> None:
+        """Persist the final simulation summary and patient rollups."""
+        if not self.writer:
+            return
+        created_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        patient_rows = [
+            (
+                row["patient_id"],
+                row["final_phase"],
+                row["current_isf"],
+                row["current_cr"],
+                row["current_basal"],
+                row["days_observed"],
+                row["mean_tir"],
+                row["early_tir"],
+                row["late_tir"],
+                row["tir_delta"],
+                row["recommendations_surfaced"],
+                row["recommendations_accepted"],
+                row["acceptance_rate"],
+                int(row["graduated_to_intervention"]),
+                int(row["entered_shadow"]),
+                row["degraduation_count"],
+                int(row["burnout_flag"]),
+                self._burnout_definition,
+            )
+            for row in summary["patient_summaries"]
+        ]
+        self.writer.write_patient_run_summary(patient_rows)
+        self.writer.write_simulation_run(
+            (
+                f"seed_{self.seed}_{int(self.run_started_at.timestamp())}",
+                created_at,
+                json.dumps(summary),
+            )
+        )
+        self.writer.write_evaluation_snapshot(
+            (
+                created_at,
+                "final_summary",
+                self.n_patients,
+                json.dumps({
+                    "mean_tir_early_window": summary["mean_tir_early_window"],
+                    "mean_tir_late_window": summary["mean_tir_late_window"],
+                    "overall_tir_delta": summary["overall_tir_delta"],
+                    "recommendation_acceptance_rate": summary["recommendation_acceptance_rate"],
+                    "burnout_count": summary["burnout_count"],
+                }),
+                json.dumps({
+                    "viability_verdict": summary["viability_verdict"],
+                    "burnout_definition": summary["burnout_definition"],
+                }),
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
