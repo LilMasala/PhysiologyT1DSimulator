@@ -10,6 +10,12 @@ from t1d_sim.constants import PERSONAS
 from t1d_sim.feedback import EventSchedule, sample_life_events
 from t1d_sim.missingness import MissingnessProfile, make_missingness_profile
 
+try:
+    from chamelia.personality import UserPersonality, sample_personality
+except ImportError:
+    UserPersonality = None  # type: ignore[assignment,misc]
+    sample_personality = None  # type: ignore[assignment]
+
 
 @dataclass
 class PatientConfig:
@@ -48,6 +54,7 @@ class PatientConfig:
     missingness_profile: MissingnessProfile | None = None
     agency_profile: UserAgencyProfile | None = None
     event_schedule: EventSchedule | None = None
+    personality: "UserPersonality | None" = None
 
     @property
     def logging_quality(self) -> str:
@@ -61,7 +68,7 @@ class PatientConfig:
 
     def to_record(self) -> dict:
         d = {k: v for k, v in asdict(self).items()
-             if k not in ("missingness_profile", "agency_profile", "event_schedule")}
+             if k not in ("missingness_profile", "agency_profile", "event_schedule", "personality")}
         d["logging_quality"] = self.logging_quality
         return d
 
@@ -128,6 +135,9 @@ def sample_population(n_patients: int, seed: int = 42, male_fraction: float = 0.
         cfg.agency_profile = sample_agency(cfg, agency_rng)
         event_rng = np.random.default_rng(int(rng.integers(0, 1_000_000)))
         cfg.event_schedule = sample_life_events(cfg, cfg.n_days, event_rng)
+        if sample_personality is not None:
+            pers_rng = np.random.default_rng(int(rng.integers(0, 1_000_000)))
+            cfg.personality = sample_personality(pers_rng)
         patients.append(cfg)
     return patients
 

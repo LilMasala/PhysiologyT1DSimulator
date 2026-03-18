@@ -324,13 +324,24 @@ class ConfidenceModule:
         calibration_scores: dict[str, float] | None = None,
         user_aggressiveness: float = 0.5,
         target_names: list[str] | None = None,
+        mood_budget_available: bool = True,
     ) -> GateResult:
-        """Run all four confidence layers + hard safety gate.
+        """Run all four confidence layers + hard safety gate + mood budget.
 
         Returns a GateResult indicating whether the recommendation should be
         surfaced and the composite confidence score.
         """
         details: dict = {}
+
+        # Mood budget gate: suppress recommendations when budget is empty
+        if not mood_budget_available:
+            return GateResult(
+                passed=False,
+                composite_score=0.0,
+                layer_scores={},
+                blocked_by="mood_budget",
+                details={"mood_budget": {"passed": False, "reason": "budget_empty"}},
+            )
 
         # Layer 1: GP Familiarity
         fam_passed, fam_score = self._check_familiarity(familiarity_score)

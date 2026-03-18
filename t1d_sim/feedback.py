@@ -511,6 +511,101 @@ def _enforce_major_constraint(
 
 
 # ───────────────────────────────────────────────────────────────────
+# Part 3c: Psychological Response Model (Section 7.1)
+# ───────────────────────────────────────────────────────────────────
+
+@dataclass
+class PsychState:
+    """Per-patient psychological state for mood feedback from system interactions."""
+    mood_valence: float = 0.0           # Current mood valence
+    recommendation_fatigue: float = 0.0  # Accumulated fatigue from frequent recs
+    recent_rec_count: int = 0           # Recs received in last 7 days
+    burned_out: bool = False            # Below burnout threshold
+
+    def reset_weekly_counter(self) -> None:
+        self.recent_rec_count = 0
+        self.recommendation_fatigue = max(0.0, self.recommendation_fatigue - 0.1)
+
+
+def apply_psychological_feedback(
+    psych: PsychState,
+    personality: "UserPersonality",  # from chamelia.personality
+    rec_accepted: bool | None,
+    rec_succeeded: bool | None,
+    received_recommendation: bool,
+    received_celebration: bool,
+    rng: np.random.Generator,
+) -> PsychState:
+    """Update psychological state from system interactions.
+
+    Models how the system's own behavior affects patient engagement.
+    An over-aggressive recommender causes burnout. A well-calibrated one
+    builds a sustained upward trajectory.
+
+    Args:
+        psych: Current psychological state.
+        personality: UserPersonality with response traits.
+        rec_accepted: Did the user accept the most recent recommendation?
+        rec_succeeded: Did the accepted recommendation improve outcomes?
+        received_recommendation: Was a recommendation surfaced today?
+        received_celebration: Was a celebration/positive observation surfaced?
+        rng: Random number generator for stochastic responses.
+
+    Returns:
+        Updated PsychState.
+    """
+    new = PsychState(
+        mood_valence=psych.mood_valence,
+        recommendation_fatigue=psych.recommendation_fatigue,
+        recent_rec_count=psych.recent_rec_count,
+        burned_out=psych.burned_out,
+    )
+
+    # Mood boost from successful recommendations
+    if rec_accepted and rec_succeeded:
+        boost = personality.mood_boost_from_success * (1.0 + rng.normal(0, 0.02))
+        new.mood_valence += boost
+
+    # Mood hit from failed recommendations
+    if rec_accepted and rec_succeeded is False:
+        hit = personality.mood_hit_from_failure * (1.0 + rng.normal(0, 0.02))
+        new.mood_valence += hit  # hit is negative
+
+    # Recommendation fatigue and overload
+    if received_recommendation:
+        new.recent_rec_count += 1
+        new.recommendation_fatigue += personality.recommendation_fatigue_rate * 0.15
+
+        # Mood hit from overload (too many recs in a short period)
+        if new.recent_rec_count > 3:
+            overload_factor = (new.recent_rec_count - 3) / 5.0
+            hit = personality.mood_hit_from_overload * overload_factor
+            new.mood_valence += hit
+
+    # Celebration boost
+    if received_celebration:
+        boost = personality.mood_boost_from_celebration * personality.celebration_receptiveness
+        new.mood_valence += boost
+
+    # Natural mood recovery toward 0 (mean reversion)
+    new.mood_valence *= 0.95
+
+    # Fatigue decay
+    new.recommendation_fatigue *= 0.90
+
+    # Clamp mood
+    new.mood_valence = float(np.clip(new.mood_valence, -1.0, 1.0))
+
+    # Burnout check
+    if new.mood_valence < personality.burnout_threshold:
+        new.burned_out = True
+    elif new.mood_valence > personality.burnout_threshold + 0.15:
+        new.burned_out = False
+
+    return new
+
+
+# ───────────────────────────────────────────────────────────────────
 # Part 3b: Active Event Resolution
 # ───────────────────────────────────────────────────────────────────
 

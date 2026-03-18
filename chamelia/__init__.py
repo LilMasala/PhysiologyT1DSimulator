@@ -23,6 +23,18 @@ from chamelia.optimizer import (
     RecommendationDecision,
 )
 from chamelia.evaluation import build_robustness_report, RobustnessReport
+from chamelia.personality import (
+    UserPersonality,
+    RecommendationBudget,
+    RecommendationFraming,
+    sample_personality,
+)
+from chamelia.therapy_modes import (
+    TherapyLevel,
+    TherapyModeState,
+    get_level_constraints,
+    compute_personalization_weight,
+)
 
 __all__ = [
     # Block 3
@@ -48,4 +60,13 @@ __all__ = [
     # Block 9
     "build_robustness_report",
     "RobustnessReport",
+    # Personality & Therapy Modes
+    "UserPersonality",
+    "RecommendationBudget",
+    "RecommendationFraming",
+    "sample_personality",
+    "TherapyLevel",
+    "TherapyModeState",
+    "get_level_constraints",
+    "compute_personalization_weight",
 ]

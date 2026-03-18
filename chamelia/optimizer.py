@@ -71,12 +71,16 @@ class ObjectiveWeights:
     """User-controlled objective weights for the reward function.
 
     reward = w_tir × TIR - w_low × %low - w_high × %high - w_var × BG_var + w_stab × stability
+           + w_mood × predicted_mood_delta - w_burden × rec_burden - w_anxiety × anxiety_cost
     """
     w_tir: float = 1.0
     w_low: float = 2.0    # Higher weight because lows are dangerous
     w_high: float = 0.5
     w_var: float = 0.1
     w_stab: float = 0.3
+    w_mood: float = 0.3          # Mood delta weight
+    w_burden: float = 0.1        # Recommendation burden penalty
+    w_anxiety: float = 0.2       # Change anxiety cost
     conservativeness: float = 0.5  # 0 = aggressive, 1 = very conservative
 
 
@@ -87,6 +91,9 @@ def compute_reward(
     baseline_action: TherapyAction,
     weights: ObjectiveWeights,
     prediction_uncertainty: float = 0.0,
+    mood_valence: float = 0.0,
+    change_anxiety: float = 0.0,
+    n_prior_recs: int = 0,
 ) -> float:
     """Compute the risk-adjusted reward for a proposed action.
 
@@ -133,6 +140,22 @@ def compute_reward(
     # Uncertainty penalty: prefer confident recommendations.
     uncertainty_penalty = 0.3 * prediction_uncertainty
     reward -= uncertainty_penalty
+
+    # Mood-integrated components (Section 6.1)
+    # Mood delta: prefer gentler recs when mood is fragile
+    if mood_valence < -0.1:
+        mood_penalty = weights.w_mood * abs(mood_valence) * change_magnitude
+        reward -= mood_penalty
+
+    # Change anxiety cost: first-ever rec carries high anxiety cost
+    if change_anxiety > 0 and change_magnitude > 0:
+        novelty_factor = max(0.1, 1.0 - 0.05 * n_prior_recs)
+        anxiety_cost = weights.w_anxiety * change_anxiety * novelty_factor * change_magnitude
+        reward -= anxiety_cost
+
+    # Recommendation burden: penalize frequent large changes
+    burden_cost = weights.w_burden * change_magnitude
+    reward -= burden_cost
 
     return float(reward)
 
@@ -228,6 +251,7 @@ class RecommendationPackage:
     primary_reward: float = 0.0
     explanation: str = ""
     risk_assessment: str = ""
+    framing: str = "tentative"  # tentative, reinforcing, gentle_reminder, celebrating
     alternatives: list[TherapyAction] = field(default_factory=list)
     baseline_prediction: dict[str, float] = field(default_factory=dict)
 

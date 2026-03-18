@@ -9,6 +9,9 @@ Components:
     - Adaptation Escalation Ladder: reweight → fine-tune → retrain → expand
     - Action Family Selection: therapy vs behaviour routing
     - Model Registry: structured catalog of every model trained
+    - Pressure-Based Retraining: accumulates signals, triggers retrain at threshold
+    - Candidate Validation: shadow-validates new models before promotion
+    - Cross-Patient Intelligence: cohort detection and transfer confidence
 """
 from __future__ import annotations
 
@@ -314,12 +317,13 @@ class MetaController:
     # Escalation: days to wait before escalating to next level.
     ESCALATION_PATIENCE = 7
 
-    def __init__(self) -> None:
+    def __init__(self, learning_mode: str = "hybrid") -> None:
         self._drift_detector = DriftDetector()
         self._registry: dict[str, ModelRegistryEntry] = {}
         self._trust_weights: dict[str, float] = {}
         self._current_escalation = EscalationLevel.NONE
         self._days_at_current_level = 0
+        self._state = MetaControllerState(global_learning_mode=learning_mode)
 
     @property
     def drift_detector(self) -> DriftDetector:
@@ -538,3 +542,319 @@ class MetaController:
         )
 
         return "therapy" if therapy_importance >= behavior_importance else "behavior"
+
+    # ------------------------------------------------------------------
+    # Pressure-Based Retraining (Section 4.1)
+    # ------------------------------------------------------------------
+
+    def accumulate_pressure(
+        self,
+        new_data_rows: int = 0,
+        intervention_data_rows: int = 0,
+        rolling_win_rate: float = 0.5,
+        prev_win_rate: float = 0.5,
+        drift_signals: list[DriftSignal] | None = None,
+        intervention_triple_count: int = 0,
+        causal_delta: float = 0.0,
+    ) -> float:
+        """Accumulate retraining pressure from multiple signals.
+
+        Called once per global day. Returns updated pressure score.
+        """
+        # Data staleness pressure
+        data_pressure = 0.01 * new_data_rows + 0.03 * intervention_data_rows
+        self._state.pressure_score += data_pressure
+
+        # Performance degradation pressure
+        win_rate_drop = max(0.0, prev_win_rate - rolling_win_rate)
+        if win_rate_drop > 0.02:
+            self._state.pressure_score += 2.0 * win_rate_drop
+        if win_rate_drop > 0.10:
+            self._state.pressure_score += 5.0 * win_rate_drop
+
+        # Drift alarm pressure
+        if drift_signals:
+            for sig in drift_signals:
+                if sig.detected:
+                    self._state.drift_alarm_count += 1
+                    if sig.drift_type == DriftType.REGIME:
+                        self._state.pressure_score += 3.0 * sig.severity
+                    else:
+                        self._state.pressure_score += 1.5 * sig.severity
+
+        # Intervention data milestone pressure
+        milestones = [100, 500, 1000, 5000]
+        prev_count = self._state.intervention_triple_count
+        self._state.intervention_triple_count = intervention_triple_count
+        for m in milestones:
+            if prev_count < m <= intervention_triple_count:
+                self._state.pressure_score += 2.0
+
+        # Negative causal delta pressure (strongest signal)
+        if causal_delta < -0.005:
+            self._state.pressure_score += 4.0 * abs(causal_delta)
+
+        # Decay during sustained good performance
+        if rolling_win_rate > 0.65 and causal_delta > 0:
+            self._state.pressure_score *= 0.95
+
+        self._state.rolling_population_win_rate = rolling_win_rate
+        self._state.rolling_causal_delta = causal_delta
+        return self._state.pressure_score
+
+    def check_retrain_trigger(self) -> bool:
+        """Check if accumulated pressure exceeds the retraining threshold.
+
+        Threshold is low early (retrain eagerly) and rises later.
+        """
+        days_since = self._state.current_day - self._state.last_retrain_day
+        # Early: threshold = 3.0, rising to 8.0 over 90 days
+        threshold = 3.0 + 5.0 * min(1.0, days_since / 90.0)
+        return self._state.pressure_score >= threshold
+
+    def reset_pressure(self, day: int) -> None:
+        """Reset pressure after a retrain."""
+        self._state.pressure_score = 0.0
+        self._state.last_retrain_day = day
+        self._state.drift_alarm_count = 0
+
+    # ------------------------------------------------------------------
+    # Candidate Validation (Section 4.4)
+    # ------------------------------------------------------------------
+
+    def register_candidate(self, model_id: str, day: int) -> None:
+        """Register a newly trained model as a candidate for validation."""
+        self._state.candidate_model_id = model_id
+        self._state.candidate_validation_start = day
+        if model_id in self._registry:
+            self._registry[model_id].status = "candidate"
+
+    def check_candidate_validation(
+        self,
+        day: int,
+        candidate_win_rate: float,
+        active_win_rate: float,
+        validation_days: int = 7,
+    ) -> str:
+        """Check if a candidate model should be promoted, kept, or rejected.
+
+        Returns: "promote", "continue", or "reject".
+        """
+        if self._state.candidate_model_id is None:
+            return "continue"
+
+        days_validating = day - (self._state.candidate_validation_start or day)
+        if days_validating < validation_days:
+            return "continue"
+
+        # Promote if candidate matches or outperforms active
+        if candidate_win_rate >= active_win_rate - 0.02:
+            return "promote"
+        else:
+            return "reject"
+
+    def promote_candidate(self) -> str | None:
+        """Promote the current candidate to active, demote previous active to standby."""
+        cid = self._state.candidate_model_id
+        if cid is None:
+            return None
+
+        # Demote current active models to standby
+        for mid, entry in self._registry.items():
+            if entry.status == "active" and mid != cid:
+                entry.status = "standby"
+
+        # Promote candidate
+        if cid in self._registry:
+            self._registry[cid].status = "active"
+
+        self._state.candidate_model_id = None
+        self._state.candidate_validation_start = None
+        return cid
+
+    def reject_candidate(self) -> str | None:
+        """Reject the current candidate model."""
+        cid = self._state.candidate_model_id
+        if cid and cid in self._registry:
+            self._registry[cid].status = "deprecated"
+        self._state.candidate_model_id = None
+        self._state.candidate_validation_start = None
+        return cid
+
+    # ------------------------------------------------------------------
+    # Cross-Patient Intelligence (Section 4.5)
+    # ------------------------------------------------------------------
+
+    def update_cohort_assignments(
+        self,
+        patient_features: dict[str, np.ndarray],
+        n_cohorts: int = 4,
+    ) -> dict[str, int]:
+        """Cluster patients by metabolic behavior for transfer learning.
+
+        Simple k-means on metabolic feature vectors. Returns patient_id → cohort_id.
+        """
+        if not patient_features:
+            return {}
+
+        pids = list(patient_features.keys())
+        X = np.array([patient_features[pid] for pid in pids])
+
+        if X.shape[0] < n_cohorts:
+            # Not enough patients to cluster
+            return {pid: 0 for pid in pids}
+
+        # Simple k-means clustering
+        from scipy.cluster.vq import kmeans2
+        try:
+            _, labels = kmeans2(X.astype(float), n_cohorts, minit="points")
+            assignments = {pid: int(label) for pid, label in zip(pids, labels)}
+        except Exception:
+            assignments = {pid: 0 for pid in pids}
+
+        self._state.patient_cohort_assignments = assignments
+        return assignments
+
+    # ------------------------------------------------------------------
+    # Escalation Ladder with Patience (Section 4.3)
+    # ------------------------------------------------------------------
+
+    def escalate_with_patience(self) -> EscalationAction:
+        """Determine escalation action respecting patience timers.
+
+        Steps:
+            1. Reweight (wait 7 days)
+            2. Fine-tune (wait 7 days)
+            3. Full retrain (wait 14 days)
+            4. Architecture expand (wait 21 days)
+            5. Human escalation (N/A)
+        """
+        patience_map = {
+            EscalationLevel.NONE: 0,
+            EscalationLevel.REWEIGHT: 7,
+            EscalationLevel.FINE_TUNE: 7,
+            EscalationLevel.RETRAIN: 14,
+            EscalationLevel.EXPAND: 21,
+        }
+
+        patience = patience_map.get(self._state.escalation_level, 7)
+
+        if self._state.escalation_patience_remaining > 0:
+            self._state.escalation_patience_remaining -= 1
+            return EscalationAction(
+                EscalationLevel(self._state.escalation_level),
+                "waiting",
+            )
+
+        # Escalate to next level
+        if self._state.escalation_level < EscalationLevel.EXPAND:
+            self._state.escalation_level = min(
+                self._state.escalation_level + 1,
+                int(EscalationLevel.EXPAND),
+            )
+            next_patience = patience_map.get(
+                EscalationLevel(self._state.escalation_level), 7,
+            )
+            self._state.escalation_patience_remaining = next_patience
+
+        return EscalationAction(
+            EscalationLevel(self._state.escalation_level),
+            "escalated",
+        )
+
+    def reset_escalation(self) -> None:
+        """Reset escalation ladder after successful intervention."""
+        self._state.escalation_level = 0
+        self._state.escalation_patience_remaining = 0
+
+    # ------------------------------------------------------------------
+    # Full Daily + Weekly Evaluation (Sections 8.2, 8.3)
+    # ------------------------------------------------------------------
+
+    def daily_check(
+        self,
+        day: int,
+        new_data_rows: int = 0,
+        intervention_data_rows: int = 0,
+        rolling_win_rate: float = 0.5,
+        prev_win_rate: float = 0.5,
+        drift_signals: list[DriftSignal] | None = None,
+        intervention_triple_count: int = 0,
+        causal_delta: float = 0.0,
+    ) -> dict[str, Any]:
+        """Lightweight daily meta-controller check.
+
+        Returns dict with pressure, retrain_triggered, candidate_status.
+        """
+        self._state.current_day = day
+
+        pressure = self.accumulate_pressure(
+            new_data_rows=new_data_rows,
+            intervention_data_rows=intervention_data_rows,
+            rolling_win_rate=rolling_win_rate,
+            prev_win_rate=prev_win_rate,
+            drift_signals=drift_signals,
+            intervention_triple_count=intervention_triple_count,
+            causal_delta=causal_delta,
+        )
+
+        retrain = self.check_retrain_trigger()
+
+        # Check candidate validation
+        candidate_status = "none"
+        if self._state.candidate_model_id is not None:
+            candidate_status = "validating"
+
+        return {
+            "pressure": pressure,
+            "retrain_triggered": retrain,
+            "candidate_status": candidate_status,
+            "escalation_level": self._state.escalation_level,
+            "day": day,
+        }
+
+    def weekly_evaluation(
+        self,
+        day: int,
+        population_win_rate: float,
+        causal_delta: float,
+        per_patient_mood: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """Full weekly meta-controller evaluation.
+
+        Returns dict with evaluation results.
+        """
+        self._state.rolling_population_win_rate = population_win_rate
+        self._state.rolling_causal_delta = causal_delta
+
+        return {
+            "day": day,
+            "population_win_rate": population_win_rate,
+            "causal_delta": causal_delta,
+            "escalation_level": self._state.escalation_level,
+            "candidate_model": self._state.candidate_model_id,
+            "pressure_score": self._state.pressure_score,
+        }
+
+
+# ---------------------------------------------------------------------------
+# Meta-Controller State
+# ---------------------------------------------------------------------------
+
+@dataclass
+class MetaControllerState:
+    """Full state of the meta-controller for serialization and restoration."""
+    pressure_score: float = 0.0
+    last_retrain_day: int = 0
+    current_day: int = 0
+    escalation_level: int = 0
+    escalation_patience_remaining: int = 0
+    candidate_model_id: str | None = None
+    candidate_validation_start: int | None = None
+    rolling_population_win_rate: float = 0.5
+    rolling_causal_delta: float = 0.0
+    drift_alarm_count: int = 0
+    intervention_triple_count: int = 0
+    patient_cohort_assignments: dict[str, int] = field(default_factory=dict)
+    global_learning_mode: str = "hybrid"
+    per_patient_recommendation_budget: dict[str, float] = field(default_factory=dict)
