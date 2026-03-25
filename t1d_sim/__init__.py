@@ -10,6 +10,13 @@ from t1d_sim.features import build_feature_frames
 from t1d_sim.patient import simulate_patient
 from t1d_sim.patient_threephase import simulate_patient_threephase, PhaseConfig
 from t1d_sim.population import sample_population, PatientConfig
+from t1d_sim.questionnaire import (
+    QuestionnaireAnswers,
+    questionnaire_to_patientconfig_priors,
+    questionnaire_to_agency_priors,
+    sample_twins_from_priors,
+    physical_priors_from_twins,
+)
 from t1d_sim.writers import SQLiteWriter, FirebaseWriter
 
 
