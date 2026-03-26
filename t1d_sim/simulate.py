@@ -44,6 +44,9 @@ class SimulationCarryState:
     drift_outcomes: list[YesterdayOutcome] = field(default_factory=list)
     sleep_totals_7d: list[float] = field(default_factory=list)
     bg_avgs_7d: list[float] = field(default_factory=list)
+    tir_daily_7d: list[float] = field(default_factory=list)
+    pct_low_daily_7d: list[float] = field(default_factory=list)
+    pct_high_daily_7d: list[float] = field(default_factory=list)
     site_history: list[str] = field(default_factory=list)
 
 
@@ -159,6 +162,18 @@ def simulate_day(
 
     mood_events = _build_mood_events(cfg, date, day_index, n_mood, ctx.mood_valence, ctx.mood_arousal)
     mood_hourly = _build_mood_hourly(date, mood_events)
+
+    cgm_finite = cgm[np.isfinite(cgm)]
+    if cgm_finite.size:
+        daily_pct_low = float(np.mean(cgm_finite < 70) * 100.0)
+        daily_pct_high = float(np.mean(cgm_finite > 180) * 100.0)
+        daily_tir = max(0.0, 100.0 - daily_pct_low - daily_pct_high)
+    else:
+        daily_pct_low = daily_pct_high = daily_tir = None
+
+    rolling_tir = _rolling_daily_mean(state.tir_daily_7d, daily_tir)
+    rolling_pct_low = _rolling_daily_mean(state.pct_low_daily_7d, daily_pct_low)
+    rolling_pct_high = _rolling_daily_mean(state.pct_high_daily_7d, daily_pct_high)
 
     sleep_total = float(behavior["sleep_minutes"])
     prior_sleep = state.sleep_totals_7d[-6:] + [sleep_total]
@@ -283,9 +298,9 @@ def simulate_day(
         frame = FeatureFrameHourly(
             hour_start_utc=hour_start.replace(minute=0, second=0, microsecond=0, tzinfo=timezone.utc),
             bg_avg=avg_bg,
-            bg_tir=None if pct_low is None or pct_high is None else max(0.0, 100.0 - pct_low - pct_high),
-            bg_percent_low=pct_low,
-            bg_percent_high=pct_high,
+            bg_tir=rolling_tir,
+            bg_percent_low=rolling_pct_low,
+            bg_percent_high=rolling_pct_high,
             bg_u_roc=uroc,
             bg_delta_avg7h=_delta(bg_window),
             bg_z_avg7h=_zscore(bg_window),
@@ -370,6 +385,9 @@ def simulate_day(
         drift_outcomes=_updated_drift_outcomes(state.drift_outcomes, day_outcome),
         sleep_totals_7d=(state.sleep_totals_7d + [sleep_total])[-7:],
         bg_avgs_7d=(state.bg_avgs_7d + ([float(np.mean(bg_valid))] if bg_valid else []))[-7:],
+        tir_daily_7d=_append_daily_metric(state.tir_daily_7d, daily_tir),
+        pct_low_daily_7d=_append_daily_metric(state.pct_low_daily_7d, daily_pct_low),
+        pct_high_daily_7d=_append_daily_metric(state.pct_high_daily_7d, daily_pct_high),
         site_history=(state.site_history + [behavior["site_location"]])[-14:],
     )
 
@@ -414,6 +432,19 @@ def _rolling_sum(values: list[float | None], window: int) -> float | None:
     if not finite:
         return None
     return float(sum(finite[-window:]))
+
+
+def _append_daily_metric(history: list[float], current: float | None, window: int = 7) -> list[float]:
+    if current is None:
+        return history[-window:]
+    return (history + [float(current)])[-window:]
+
+
+def _rolling_daily_mean(history: list[float], current: float | None, window: int = 7) -> float | None:
+    values = _append_daily_metric(history, current, window)
+    if not values:
+        return None
+    return float(np.mean(values))
 
 
 def _delta(values: list[float | None]) -> float | None:

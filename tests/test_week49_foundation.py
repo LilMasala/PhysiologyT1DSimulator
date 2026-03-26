@@ -103,7 +103,18 @@ def test_build_run_report_exposes_realized_metrics_and_trends():
             "mood_valence": 0.1 * day,
             "mood_arousal": 0.2,
             "stress_acute": 0.0,
-            "graduation_status": {"graduated": day >= 2, "belief_mode": "kalman", "jepa_weights_loaded": False},
+            "graduation_status": {
+                "graduated": day >= 2,
+                "belief_mode": "kalman",
+                "jepa_weights_loaded": False,
+                "belief_entropy": 0.21,
+                "familiarity": 0.74,
+                "concordance": 0.69,
+                "calibration": 0.77,
+                "trust_level": 0.63,
+                "burnout_level": 0.18,
+                "no_surface_streak": 2,
+            },
             "recommendation": recommendation if day == 2 else None,
             "patient_response": "accept" if day == 2 else None,
             "schedule_changed": day == 2,
@@ -111,12 +122,28 @@ def test_build_run_report_exposes_realized_metrics_and_trends():
             "action_level": 1 if day == 2 else None,
             "action_family": "parameter_adjustment" if day == 2 else None,
             "predicted_improvement": 0.08 if day == 2 else None,
+            "confidence": 0.78 if day == 2 else None,
+            "confidence_breakdown": {
+                "familiarity": 0.74,
+                "concordance": 0.69,
+                "calibration": 0.77,
+                "effect_support": 0.81,
+                "selection_penalty": 1.0,
+                "final_confidence": 0.78,
+            } if day == 2 else None,
             "predicted_outcomes": {
                 "delta_tir": 0.05,
                 "delta_pct_low": -0.002,
                 "delta_pct_high": -0.04,
                 "delta_bg_avg": -12.0,
                 "delta_cost_mean": -0.03,
+            } if day == 2 else None,
+            "predicted_uncertainty": {
+                "tir_std": 0.03,
+                "pct_low_std": 0.004,
+                "pct_high_std": 0.05,
+                "bg_avg_std": 11.0,
+                "cost_std": 0.08,
             } if day == 2 else None,
             "segment_summaries": [{"label": "6:00 AM-12:00 PM"}] if day == 2 else None,
             "structure_summaries": [] if day == 2 else None,
@@ -156,3 +183,9 @@ def test_build_run_report_exposes_realized_metrics_and_trends():
     assert report["trend_series"]["mood_valence_daily"][0] == 0.1
     assert report["recommendation_timeline"][0]["predicted_outcomes"]["delta_tir"] == 0.05
     assert report["realized_outcome_timeline"][0]["pct_high_delta"] < 0.0
+    assert report["competence_snapshot"]["familiarity"] == 0.74
+    assert report["calibration_summary"]["paired_count"] == 1
+    assert report["calibration_summary"]["tir_direction_match_rate"] == 1.0
+    assert report["uncertainty_summary"]["count"] == 1
+    assert report["uncertainty_summary"]["mean_confidence"] == 0.78
+    assert report["recommendation_timeline"][0]["predicted_uncertainty"]["tir_std"] == 0.03

@@ -286,7 +286,9 @@ def main() -> None:
                 "confidence": recommendation.get("confidence"),
                 "effect_size": recommendation.get("effect_size"),
                 "predicted_improvement": recommendation.get("predicted_improvement"),
+                "confidence_breakdown": recommendation.get("confidence_breakdown"),
                 "predicted_outcomes": recommendation.get("predicted_outcomes"),
+                "predicted_uncertainty": recommendation.get("predicted_uncertainty"),
                 "segment_summaries": recommendation.get("segment_summaries") or [],
                 "structure_summaries": recommendation.get("structure_summaries") or [],
             })
@@ -330,7 +332,9 @@ def main() -> None:
             "action_family": recommendation.get("action_family") if recommendation else None,
             "burnout_attribution": recommendation.get("burnout_attribution") if recommendation else None,
             "predicted_improvement": recommendation.get("predicted_improvement") if recommendation else None,
+            "confidence_breakdown": recommendation.get("confidence_breakdown") if recommendation else None,
             "predicted_outcomes": recommendation.get("predicted_outcomes") if recommendation else None,
+            "predicted_uncertainty": recommendation.get("predicted_uncertainty") if recommendation else None,
             "segment_summaries": recommendation.get("segment_summaries") if recommendation else None,
             "structure_summaries": recommendation.get("structure_summaries") if recommendation else None,
             "decision_withheld": bool(status.get("graduated")) and recommendation is None,
@@ -338,6 +342,13 @@ def main() -> None:
             "jepa_active": status.get("jepa_active"),
             "jepa_weights_loaded": status.get("jepa_weights_loaded"),
             "configurator_mode": status.get("configurator_mode"),
+            "belief_entropy": status.get("belief_entropy"),
+            "familiarity": status.get("familiarity"),
+            "concordance": status.get("concordance"),
+            "calibration": status.get("calibration"),
+            "trust_level": status.get("trust_level"),
+            "burnout_level": status.get("burnout_level"),
+            "no_surface_streak": status.get("no_surface_streak"),
             "decision_block_reason": status.get("last_decision_reason"),
             "safety_diagnostics": status.get("last_safety_diagnostics"),
         })
@@ -550,6 +561,8 @@ def build_run_report(
     realized_outcomes = _recommendation_outcome_summary(log_entries)
     realized_positive_count = sum(1 for item in realized_outcomes if item.get("positive"))
     recommendations_with_followup = len(realized_outcomes)
+    calibration_summary = _calibration_summary(recs, realized_outcomes)
+    uncertainty_summary = _uncertainty_summary(recs)
 
     final_status = log_entries[-1].get("graduation_status") if log_entries else {}
     return {
@@ -589,6 +602,15 @@ def build_run_report(
         "jepa_active_days": len(jepa_entries),
         "first_jepa_day": first_jepa_day,
         "jepa_weights_loaded": bool(final_status.get("jepa_weights_loaded")),
+        "competence_snapshot": {
+            "belief_entropy": final_status.get("belief_entropy"),
+            "familiarity": final_status.get("familiarity"),
+            "concordance": final_status.get("concordance"),
+            "calibration": final_status.get("calibration"),
+            "trust_level": final_status.get("trust_level"),
+            "burnout_level": final_status.get("burnout_level"),
+            "no_surface_streak": final_status.get("no_surface_streak"),
+        },
         "configurator_mode_counts": dict(configurator_modes),
         "post_graduation_days": len(post_grad_entries),
         "post_graduation_no_surface_days": len(post_grad_withheld),
@@ -597,6 +619,8 @@ def build_run_report(
         "post_graduation_block_reasons": _block_reason_counts(post_grad_withheld),
         "trend_series": trend_series,
         "realized_outcome_timeline": realized_outcomes,
+        "calibration_summary": calibration_summary,
+        "uncertainty_summary": uncertainty_summary,
         "recommendation_timeline": [
             {
                 "day": entry.get("day"),
@@ -608,7 +632,10 @@ def build_run_report(
                 "schedule_changed": entry.get("schedule_changed"),
                 "realized_cost": entry.get("realized_cost"),
                 "predicted_improvement": entry.get("predicted_improvement"),
+                "confidence": entry.get("confidence"),
+                "confidence_breakdown": entry.get("confidence_breakdown"),
                 "predicted_outcomes": entry.get("predicted_outcomes"),
+                "predicted_uncertainty": entry.get("predicted_uncertainty"),
                 "segment_summaries": entry.get("segment_summaries") or [],
                 "structure_summaries": entry.get("structure_summaries") or [],
             }
@@ -628,6 +655,94 @@ def build_run_report(
         ],
         "final_status": final_status,
     }
+
+
+def _calibration_summary(
+    recommendations: list[dict[str, Any]],
+    realized_outcomes: list[dict[str, Any]],
+) -> dict[str, Any]:
+    realized_by_day = {
+        int(item["day"]): item
+        for item in realized_outcomes
+        if item.get("day") is not None
+    }
+
+
+def _uncertainty_summary(recommendations: list[dict[str, Any]]) -> dict[str, Any]:
+    uncertainty_items = [
+        recommendation.get("predicted_uncertainty") or {}
+        for recommendation in recommendations
+        if recommendation.get("predicted_uncertainty")
+    ]
+    confidence_items = [
+        recommendation.get("confidence_breakdown") or {}
+        for recommendation in recommendations
+        if recommendation.get("confidence_breakdown")
+    ]
+    return {
+        "count": len(uncertainty_items),
+        "tir_std_mean": _safe_mean([float(item.get("tir_std", 0.0)) for item in uncertainty_items]),
+        "pct_low_std_mean": _safe_mean([float(item.get("pct_low_std", 0.0)) for item in uncertainty_items]),
+        "pct_high_std_mean": _safe_mean([float(item.get("pct_high_std", 0.0)) for item in uncertainty_items]),
+        "bg_avg_std_mean": _safe_mean([float(item.get("bg_avg_std", 0.0)) for item in uncertainty_items]),
+        "cost_std_mean": _safe_mean([float(item.get("cost_std", 0.0)) for item in uncertainty_items]),
+        "mean_confidence": _safe_mean([float(item.get("final_confidence", 0.0)) for item in confidence_items]),
+        "mean_familiarity": _safe_mean([float(item.get("familiarity", 0.0)) for item in confidence_items]),
+        "mean_concordance": _safe_mean([float(item.get("concordance", 0.0)) for item in confidence_items]),
+        "mean_calibration": _safe_mean([float(item.get("calibration", 0.0)) for item in confidence_items]),
+        "mean_effect_support": _safe_mean([float(item.get("effect_support", 0.0)) for item in confidence_items]),
+    }
+    paired: list[dict[str, float | bool | int]] = []
+
+    for recommendation in recommendations:
+        day = recommendation.get("day")
+        predicted = recommendation.get("predicted_outcomes") or {}
+        realized = realized_by_day.get(int(day)) if day is not None else None
+        if not predicted or realized is None:
+            continue
+        paired.append({
+            "day": int(day),
+            "tir_abs_error": abs(float(predicted.get("delta_tir", 0.0)) - float(realized.get("tir_delta", 0.0))),
+            "pct_low_abs_error": abs(float(predicted.get("delta_pct_low", 0.0)) - float(realized.get("pct_low_delta", 0.0))),
+            "pct_high_abs_error": abs(float(predicted.get("delta_pct_high", 0.0)) - float(realized.get("pct_high_delta", 0.0))),
+            "bg_avg_abs_error": abs(float(predicted.get("delta_bg_avg", 0.0)) - float(realized.get("bg_avg_delta", 0.0))),
+            "cost_abs_error": abs(float(predicted.get("delta_cost_mean", 0.0)) - float(realized.get("cost_delta", 0.0))),
+            "tir_direction_match": _direction_match(
+                float(predicted.get("delta_tir", 0.0)),
+                float(realized.get("tir_delta", 0.0)),
+                prefer_positive=True,
+            ),
+            "pct_low_direction_match": _direction_match(
+                float(predicted.get("delta_pct_low", 0.0)),
+                float(realized.get("pct_low_delta", 0.0)),
+                prefer_positive=False,
+            ),
+            "pct_high_direction_match": _direction_match(
+                float(predicted.get("delta_pct_high", 0.0)),
+                float(realized.get("pct_high_delta", 0.0)),
+                prefer_positive=False,
+            ),
+        })
+
+    return {
+        "paired_count": len(paired),
+        "tir_mae": _safe_mean([float(item["tir_abs_error"]) for item in paired]),
+        "pct_low_mae": _safe_mean([float(item["pct_low_abs_error"]) for item in paired]),
+        "pct_high_mae": _safe_mean([float(item["pct_high_abs_error"]) for item in paired]),
+        "bg_avg_mae": _safe_mean([float(item["bg_avg_abs_error"]) for item in paired]),
+        "cost_mae": _safe_mean([float(item["cost_abs_error"]) for item in paired]),
+        "tir_direction_match_rate": _safe_mean([1.0 if item["tir_direction_match"] else 0.0 for item in paired]),
+        "pct_low_direction_match_rate": _safe_mean([1.0 if item["pct_low_direction_match"] else 0.0 for item in paired]),
+        "pct_high_direction_match_rate": _safe_mean([1.0 if item["pct_high_direction_match"] else 0.0 for item in paired]),
+    }
+
+
+def _direction_match(predicted: float, realized: float, *, prefer_positive: bool) -> bool:
+    if abs(predicted) < 1e-9 or abs(realized) < 1e-9:
+        return abs(predicted - realized) < 1e-9
+    if prefer_positive:
+        return (predicted > 0 and realized > 0) or (predicted < 0 and realized < 0)
+    return (predicted < 0 and realized < 0) or (predicted > 0 and realized > 0)
 
 
 def print_progress(day: int, total_days: int, current_date: datetime, entry: dict) -> None:

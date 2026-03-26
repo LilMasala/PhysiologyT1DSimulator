@@ -124,7 +124,8 @@ def _print_status(uid: str, email: str | None, report: dict | None, chamelia_url
         print(f"  graduated_day: {report.get('graduated_day')}")
         print(f"  recommendation_count: {report.get('recommendation_count')}")
         print(f"  tir_final_14d_mean: {report.get('tir_final_14d_mean', 0.0):.3f}")
-        print(f"  success_rate: {report.get('recommendation_success_rate', 0.0):.3f}")
+        print(f"  accept_or_partial_rate: {report.get('accept_or_partial_rate', 0.0):.3f}")
+        print(f"  realized_positive_outcome_rate: {report.get('realized_positive_outcome_rate', 0.0):.3f}")
     try:
         client = ChameliaClient(chamelia_url)
         status = client.graduation_status(uid).get("status", {})
@@ -142,7 +143,20 @@ def _print_report(report: dict | None) -> None:
     print(f"  generatedAt: {report.get('generatedAt')}")
     print(f"  final_status: {report.get('final_status')}")
     print(f"  post_graduation_no_surface_days: {report.get('post_graduation_no_surface_days')}")
+    print(f"  post_graduation_surface_days: {report.get('post_graduation_surface_days')}")
     print(f"  block_reasons: {report.get('block_reasons')}")
+    print(f"  post_graduation_block_reasons: {report.get('post_graduation_block_reasons')}")
+    print(
+        "  rates: "
+        f"accept_or_partial={report.get('accept_or_partial_rate', 0.0):.3f} | "
+        f"schedule_change={report.get('schedule_change_rate', 0.0):.3f} | "
+        f"realized_positive={report.get('realized_positive_outcome_rate', 0.0):.3f}"
+    )
+    print(
+        "  trends: "
+        f"TIR14d {report.get('tir_baseline_14d_mean', 0.0):.3f} -> {report.get('tir_final_14d_mean', 0.0):.3f} | "
+        f"delta={report.get('tir_delta_baseline_vs_final_14d', 0.0):+.3f}"
+    )
 
 
 def _print_schedule(schedule) -> None:
