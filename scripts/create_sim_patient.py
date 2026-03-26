@@ -255,6 +255,7 @@ def main() -> None:
         compliance = 0.0
         schedule_changed = False
         status = step_response.get("status") or observe_response.get("status") or {}
+        realized_cost = compute_realized_cost(signals)
 
         rec_id = step_response.get("rec_id")
         if recommendation and rec_id is not None:
@@ -264,13 +265,12 @@ def main() -> None:
                 if schedule_changed:
                     writer.write_therapy_snapshot(sim_state.current_schedule, timestamp=current_date + timedelta(hours=23))
 
-            cost = compute_realized_cost(signals)
             chamelia.record_outcome(
                 uid,
                 int(rec_id),
                 response_name,
                 signals,
-                cost,
+                realized_cost,
             )
             sim_state.recommendation_history.append({
                 "day": cumulative_day,
@@ -285,15 +285,18 @@ def main() -> None:
                 "action_family": recommendation.get("action_family"),
                 "confidence": recommendation.get("confidence"),
                 "effect_size": recommendation.get("effect_size"),
+                "predicted_improvement": recommendation.get("predicted_improvement"),
+                "predicted_outcomes": recommendation.get("predicted_outcomes"),
+                "segment_summaries": recommendation.get("segment_summaries") or [],
+                "structure_summaries": recommendation.get("structure_summaries") or [],
             })
         elif rec_id is not None:
-            cost = compute_realized_cost(signals)
             chamelia.record_outcome(
                 uid,
                 int(rec_id),
                 None,
                 signals,
-                cost,
+                realized_cost,
             )
 
         if rec_id is not None:
@@ -312,6 +315,10 @@ def main() -> None:
             "tir_7d": signals.get("tir_7d"),
             "pct_low_7d": signals.get("pct_low_7d"),
             "pct_high_7d": signals.get("pct_high_7d"),
+            "realized_cost": realized_cost,
+            "mood_valence": signals.get("valence"),
+            "mood_arousal": signals.get("arousal"),
+            "stress_acute": signals.get("stress_acute"),
             "graduation_status": status,
             "recommendation": recommendation,
             "recommendation_returned": recommendation is not None,
@@ -322,6 +329,10 @@ def main() -> None:
             "action_level": recommendation.get("action_level") if recommendation else None,
             "action_family": recommendation.get("action_family") if recommendation else None,
             "burnout_attribution": recommendation.get("burnout_attribution") if recommendation else None,
+            "predicted_improvement": recommendation.get("predicted_improvement") if recommendation else None,
+            "predicted_outcomes": recommendation.get("predicted_outcomes") if recommendation else None,
+            "segment_summaries": recommendation.get("segment_summaries") if recommendation else None,
+            "structure_summaries": recommendation.get("structure_summaries") if recommendation else None,
             "decision_withheld": bool(status.get("graduated")) and recommendation is None,
             "jepa_status": status.get("belief_mode"),
             "jepa_active": status.get("jepa_active"),
@@ -353,7 +364,8 @@ def main() -> None:
     if email and args.password and not args.no_firebase:
         print(f"Login with: {email} / {args.password}")
     print(f"Final status: {report['final_status']}")
-    print(f"Recommendation success rate: {report['recommendation_success_rate']:.3f}")
+    print(f"Accept+partial rate: {report['accept_or_partial_rate']:.3f}")
+    print(f"Realized positive outcome rate: {report['realized_positive_outcome_rate']:.3f}")
     print(f"Graduated on day: {report['graduated_day']}")
     print(f"Recommendations surfaced: {report['recommendation_count']} (post-grad withheld: {report['post_graduation_no_surface_days']})")
     print(f"Report written to: {report_path}")
@@ -510,19 +522,23 @@ def build_run_report(
 ) -> dict[str, Any]:
     recs = [entry for entry in log_entries if entry.get("recommendation")]
     accepted = [r for r in recs if r.get("patient_response") in {"accept", "partial"}]
+    accepted_exact = [r for r in recs if r.get("patient_response") == "accept"]
+    partials = [r for r in recs if r.get("patient_response") == "partial"]
+    rejected = [r for r in recs if r.get("patient_response") == "reject"]
+    schedule_changed_entries = [r for r in recs if r.get("schedule_changed")]
     graduated_day = next((int(entry["day"]) for entry in log_entries if (entry.get("graduation_status") or {}).get("graduated")), None)
     post_grad_entries = [
         entry for entry in log_entries
         if graduated_day is not None and int(entry.get("day", 0)) >= graduated_day
     ]
     post_grad_withheld = [entry for entry in post_grad_entries if entry.get("recommendation") is None]
+    post_grad_surfaced = [entry for entry in post_grad_entries if entry.get("recommendation") is not None]
 
     tirs = [float(entry["tir_7d"]) for entry in log_entries if entry.get("tir_7d") is not None]
     baseline_tirs = tirs[:14]
     final_tirs = tirs[-14:]
     lows = [float(entry.get("pct_low_7d", 0.0)) for entry in log_entries if entry.get("pct_low_7d") is not None]
     highs = [float(entry.get("pct_high_7d", 0.0)) for entry in log_entries if entry.get("pct_high_7d") is not None]
-    successful = [rec for rec in sim_state.recommendation_history if rec.get("successful")]
     jepa_entries = [entry for entry in log_entries if entry.get("jepa_active")]
     first_jepa_day = next((int(entry["day"]) for entry in log_entries if entry.get("jepa_active")), None)
     configurator_modes = Counter(
@@ -530,6 +546,10 @@ def build_run_report(
         for entry in log_entries
         if entry.get("configurator_mode")
     )
+    trend_series = _build_trend_series(log_entries)
+    realized_outcomes = _recommendation_outcome_summary(log_entries)
+    realized_positive_count = sum(1 for item in realized_outcomes if item.get("positive"))
+    recommendations_with_followup = len(realized_outcomes)
 
     final_status = log_entries[-1].get("graduation_status") if log_entries else {}
     return {
@@ -543,18 +563,27 @@ def build_run_report(
         "days_this_run": days_this_run,
         "graduated_day": graduated_day,
         "recommendation_count": len(recs),
-        "accepted_count": len([r for r in recs if r.get("patient_response") == "accept"]),
-        "partial_count": len([r for r in recs if r.get("patient_response") == "partial"]),
-        "rejected_count": len([r for r in recs if r.get("patient_response") == "reject"]),
-        "recommendation_success_rate": len(successful) / max(len(accepted), 1),
-        "tir_mean": sum(tirs) / max(len(tirs), 1),
-        "tir_baseline_14d_mean": sum(baseline_tirs) / max(len(baseline_tirs), 1),
-        "tir_final_14d_mean": sum(final_tirs) / max(len(final_tirs), 1),
+        "accepted_count": len(accepted_exact),
+        "partial_count": len(partials),
+        "rejected_count": len(rejected),
+        "accept_or_partial_count": len(accepted),
+        "accept_or_partial_rate": len(accepted) / max(len(recs), 1),
+        "exact_accept_rate": len(accepted_exact) / max(len(recs), 1),
+        "schedule_changed_count": len(schedule_changed_entries),
+        "schedule_change_rate": len(schedule_changed_entries) / max(len(recs), 1),
+        "recommendations_with_followup": recommendations_with_followup,
+        "realized_positive_outcome_count": realized_positive_count,
+        "realized_positive_outcome_rate": realized_positive_count / max(recommendations_with_followup, 1),
+        # Backward-compatible alias; now defined in terms of explicit post-recommendation followup windows.
+        "recommendation_success_rate": realized_positive_count / max(recommendations_with_followup, 1),
+        "tir_mean": _safe_mean(tirs),
+        "tir_baseline_14d_mean": _safe_mean(baseline_tirs),
+        "tir_final_14d_mean": _safe_mean(final_tirs),
         "tir_delta_baseline_vs_final_14d": (
-            (sum(final_tirs) / max(len(final_tirs), 1)) - (sum(baseline_tirs) / max(len(baseline_tirs), 1))
+            _safe_mean(final_tirs) - _safe_mean(baseline_tirs)
         ),
-        "pct_low_mean": sum(lows) / max(len(lows), 1),
-        "pct_high_mean": sum(highs) / max(len(highs), 1),
+        "pct_low_mean": _safe_mean(lows),
+        "pct_high_mean": _safe_mean(highs),
         "accepted_recommendation_days": len(accepted),
         "jepa_status": final_status.get("belief_mode"),
         "jepa_active_days": len(jepa_entries),
@@ -563,7 +592,11 @@ def build_run_report(
         "configurator_mode_counts": dict(configurator_modes),
         "post_graduation_days": len(post_grad_entries),
         "post_graduation_no_surface_days": len(post_grad_withheld),
+        "post_graduation_surface_days": len(post_grad_surfaced),
         "block_reasons": _block_reason_counts(log_entries),
+        "post_graduation_block_reasons": _block_reason_counts(post_grad_withheld),
+        "trend_series": trend_series,
+        "realized_outcome_timeline": realized_outcomes,
         "recommendation_timeline": [
             {
                 "day": entry.get("day"),
@@ -573,6 +606,11 @@ def build_run_report(
                 "action_family": entry.get("action_family"),
                 "patient_response": entry.get("patient_response"),
                 "schedule_changed": entry.get("schedule_changed"),
+                "realized_cost": entry.get("realized_cost"),
+                "predicted_improvement": entry.get("predicted_improvement"),
+                "predicted_outcomes": entry.get("predicted_outcomes"),
+                "segment_summaries": entry.get("segment_summaries") or [],
+                "structure_summaries": entry.get("structure_summaries") or [],
             }
             for entry in recs
         ],
@@ -684,6 +722,123 @@ def _block_reason_counts(log_entries: list[dict]) -> dict[str, int]:
             continue
         counts[str(reason)] = counts.get(str(reason), 0) + 1
     return counts
+
+
+def _safe_mean(values: list[float]) -> float:
+    return sum(values) / max(len(values), 1)
+
+
+def _rolling_mean(values: list[float], window: int) -> list[float]:
+    out: list[float] = []
+    for idx in range(len(values)):
+        start = max(0, idx - window + 1)
+        out.append(_safe_mean(values[start:idx + 1]))
+    return out
+
+
+def _entry_cost(entry: dict[str, Any]) -> float:
+    explicit = entry.get("realized_cost")
+    if explicit is not None:
+        return float(explicit)
+    pct_low = float(entry.get("pct_low_7d") or 0.0)
+    pct_high = float(entry.get("pct_high_7d") or 0.0)
+    return pct_low * 5.0 + pct_high
+
+
+def _build_trend_series(log_entries: list[dict[str, Any]]) -> dict[str, list[Any]]:
+    ordered = sorted(log_entries, key=lambda entry: int(entry.get("day", 0)))
+    dates = [entry.get("date") for entry in ordered]
+    tir = [float(entry.get("tir_7d") or 0.0) for entry in ordered]
+    pct_low = [float(entry.get("pct_low_7d") or 0.0) for entry in ordered]
+    pct_high = [float(entry.get("pct_high_7d") or 0.0) for entry in ordered]
+    bg_avg = [float(entry.get("bg_avg") or 0.0) for entry in ordered]
+    realized_cost = [_entry_cost(entry) for entry in ordered]
+    mood_valence = [None if entry.get("mood_valence") is None else float(entry["mood_valence"]) for entry in ordered]
+    mood_arousal = [None if entry.get("mood_arousal") is None else float(entry["mood_arousal"]) for entry in ordered]
+    stress_acute = [None if entry.get("stress_acute") is None else float(entry["stress_acute"]) for entry in ordered]
+    return {
+        "dates": dates,
+        "tir_daily": tir,
+        "tir_rolling_14d": _rolling_mean(tir, 14),
+        "pct_low_daily": pct_low,
+        "pct_low_rolling_14d": _rolling_mean(pct_low, 14),
+        "pct_high_daily": pct_high,
+        "pct_high_rolling_14d": _rolling_mean(pct_high, 14),
+        "bg_avg_daily": bg_avg,
+        "bg_avg_rolling_14d": _rolling_mean(bg_avg, 14),
+        "realized_cost_daily": realized_cost,
+        "realized_cost_rolling_14d": _rolling_mean(realized_cost, 14),
+        "mood_valence_daily": mood_valence,
+        "mood_arousal_daily": mood_arousal,
+        "stress_acute_daily": stress_acute,
+    }
+
+
+def _recommendation_outcome_summary(
+    log_entries: list[dict[str, Any]],
+    *,
+    horizon_days: int = 3,
+    min_tir_gain: float = 0.01,
+    min_cost_drop: float = 0.01,
+) -> list[dict[str, Any]]:
+    ordered = sorted(log_entries, key=lambda entry: int(entry.get("day", 0)))
+    by_day = {int(entry.get("day", 0)): entry for entry in ordered}
+    outcomes: list[dict[str, Any]] = []
+    for entry in ordered:
+        if entry.get("patient_response") not in {"accept", "partial"}:
+            continue
+        if not entry.get("recommendation"):
+            continue
+        day = int(entry.get("day", 0))
+        before_days = [candidate for candidate in range(max(1, day - horizon_days), day + 1) if candidate in by_day]
+        after_days = [candidate for candidate in range(day + 1, day + horizon_days + 1) if candidate in by_day]
+        if not after_days:
+            continue
+
+        before_entries = [by_day[candidate] for candidate in before_days]
+        after_entries = [by_day[candidate] for candidate in after_days]
+        before_tir = _safe_mean([float(item.get("tir_7d") or 0.0) for item in before_entries])
+        after_tir = _safe_mean([float(item.get("tir_7d") or 0.0) for item in after_entries])
+        before_pct_low = _safe_mean([float(item.get("pct_low_7d") or 0.0) for item in before_entries])
+        after_pct_low = _safe_mean([float(item.get("pct_low_7d") or 0.0) for item in after_entries])
+        before_pct_high = _safe_mean([float(item.get("pct_high_7d") or 0.0) for item in before_entries])
+        after_pct_high = _safe_mean([float(item.get("pct_high_7d") or 0.0) for item in after_entries])
+        before_bg_avg = _safe_mean([float(item.get("bg_avg") or 0.0) for item in before_entries])
+        after_bg_avg = _safe_mean([float(item.get("bg_avg") or 0.0) for item in after_entries])
+        before_cost = _safe_mean([_entry_cost(item) for item in before_entries])
+        after_cost = _safe_mean([_entry_cost(item) for item in after_entries])
+
+        tir_delta = after_tir - before_tir
+        pct_low_delta = after_pct_low - before_pct_low
+        pct_high_delta = after_pct_high - before_pct_high
+        bg_avg_delta = after_bg_avg - before_bg_avg
+        cost_delta = after_cost - before_cost
+        outcomes.append({
+            "day": day,
+            "date": entry.get("date"),
+            "patient_response": entry.get("patient_response"),
+            "horizon_days": horizon_days,
+            "before_tir": before_tir,
+            "after_tir": after_tir,
+            "tir_delta": tir_delta,
+            "before_pct_low": before_pct_low,
+            "after_pct_low": after_pct_low,
+            "pct_low_delta": pct_low_delta,
+            "before_pct_high": before_pct_high,
+            "after_pct_high": after_pct_high,
+            "pct_high_delta": pct_high_delta,
+            "before_bg_avg": before_bg_avg,
+            "after_bg_avg": after_bg_avg,
+            "bg_avg_delta": bg_avg_delta,
+            "before_cost": before_cost,
+            "after_cost": after_cost,
+            "cost_delta": cost_delta,
+            "positive": (
+                (cost_delta <= -min_cost_drop or tir_delta >= min_tir_gain)
+                and pct_low_delta <= 0.0
+            ),
+        })
+    return outcomes
 
 
 def _successful_day(result) -> bool:
