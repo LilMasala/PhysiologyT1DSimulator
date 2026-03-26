@@ -25,6 +25,7 @@ from t1d_sim.missingness import (
 from t1d_sim.observation import observe_cgm, synthesize_hr, synthesize_energy
 from t1d_sim.physiology import apply_context_effectors, simulate_day_cgm
 from t1d_sim.population import PatientConfig
+from t1d_sim.therapy import make_default_schedule
 
 
 def _iso_hour(dt: datetime) -> str:
@@ -51,6 +52,7 @@ def simulate_patient(cfg: PatientConfig, days: int, start_utc: datetime) -> dict
     schedule = cfg.event_schedule or EventSchedule()
     outcome: YesterdayOutcome | None = None
     drift_outcomes: list[YesterdayOutcome] = []
+    therapy_schedule = cfg.therapy_schedule or cfg.baseline_therapy_schedule or make_default_schedule(cfg)
 
     for d in range(days):
         day_start = start_utc + timedelta(days=d)
@@ -75,7 +77,13 @@ def simulate_patient(cfg: PatientConfig, days: int, start_utc: datetime) -> dict
 
         # 4. Apply physiology with events
         mod = apply_context_effectors(base, ctx, patient_state=state, event_modifiers=event_mods)
-        true_bg = simulate_day_cgm(base, mod, beh["meals"], cfg.seed * 10000 + d)
+        true_bg = simulate_day_cgm(
+            base,
+            mod,
+            beh["meals"],
+            cfg.seed * 10000 + d,
+            therapy_schedule=therapy_schedule,
+        )
 
         # 5. Compute outcome for tomorrow's feedback
         outcome = compute_yesterday_outcome(true_bg, beh, outcome)
@@ -166,7 +174,16 @@ def simulate_patient(cfg: PatientConfig, days: int, start_utc: datetime) -> dict
                 ex = 0.0
             exercise_rows.append((cfg.patient_id, ts, ex, ex, ex))
 
-            therapy_rows.append((cfg.patient_id, ts, THERAPY_PROFILE_ID, THERAPY_PROFILE_NAME, 12.0 * cfg.cr_multiplier, 0.85 * cfg.basal_multiplier, 45.0 / cfg.isf_multiplier))
+            seg = therapy_schedule.value_at_minute(h * 60)
+            therapy_rows.append((
+                cfg.patient_id,
+                ts,
+                THERAPY_PROFILE_ID,
+                THERAPY_PROFILE_NAME,
+                seg.cr,
+                seg.basal,
+                seg.isf,
+            ))
             mood_hourly_rows.append((cfg.patient_id, ts, ctx.mood_valence, ctx.mood_arousal, int(ctx.mood_valence >= 0 and ctx.mood_arousal >= 0), int(ctx.mood_valence >= 0 and ctx.mood_arousal < 0), int(ctx.mood_valence < 0 and ctx.mood_arousal >= 0), int(ctx.mood_valence < 0 and ctx.mood_arousal < 0), float(h)))
 
         dstr = day_start.strftime("%Y-%m-%d")
@@ -192,7 +209,27 @@ def simulate_patient(cfg: PatientConfig, days: int, start_utc: datetime) -> dict
                 mood_events.append((cfg.patient_id, str(uuid.uuid4()), ts_me.strftime("%Y-%m-%dT%H:%M:%SZ"), ctx.mood_valence, ctx.mood_arousal))
 
         active_event_names = json.dumps([ae.event.event_type.value for ae in active])
-        gt_rows.append((cfg.patient_id, dstr, 45.0 * (mod["k1"] / base["k1"]), 12.0 * cfg.cr_multiplier, 0.85 * cfg.basal_multiplier, json.dumps([m[0].strftime("%H:%M") for m in beh["meals"]]), json.dumps([round(m[1], 1) for m in beh["meals"]]), int(beh["exercise_minutes"]), beh["exercise_intensity"], int(beh["sleep_minutes"]), str(ctx.cycle_phase), ctx.mood_valence, ctx.mood_arousal, ctx.stress, 0, "", state.effective_isf_mult, state.effective_fitness, active_event_names))
+        gt_rows.append((
+            cfg.patient_id,
+            dstr,
+            45.0 * (mod["k1"] / base["k1"]),
+            therapy_schedule.weighted_mean("cr"),
+            therapy_schedule.weighted_mean("basal"),
+            json.dumps([m[0].strftime("%H:%M") for m in beh["meals"]]),
+            json.dumps([round(m[1], 1) for m in beh["meals"]]),
+            int(beh["exercise_minutes"]),
+            beh["exercise_intensity"],
+            int(beh["sleep_minutes"]),
+            str(ctx.cycle_phase),
+            ctx.mood_valence,
+            ctx.mood_arousal,
+            ctx.stress,
+            0,
+            "",
+            state.effective_isf_mult,
+            state.effective_fitness,
+            active_event_names,
+        ))
     return {
         "patient": cfg.to_record(), "bg_hourly": bg_rows, "hr_hourly": hr_rows,
         "energy_hourly": energy_rows, "exercise_hourly": exercise_rows, "sleep_daily": sleep_rows,

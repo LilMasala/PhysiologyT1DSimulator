@@ -125,6 +125,17 @@ def apply_daily_feedback(
         stress_boost = 0.08 * (1.0 - outcome.tir) * cfg.stress_reactivity
         mods["stress_add"] = mods.get("stress_add", 0.0) + stress_boost
 
+    # ── Good glycemic days allow real recovery ──
+    if outcome.tir > 0.72 and outcome.percent_low < 0.03:
+        relief = min(0.08, 0.10 * (outcome.tir - 0.72))
+        mods["stress_add"] = mods.get("stress_add", 0.0) - relief
+        mods["mood_bias"] = mods.get("mood_bias", 0.0) + min(0.18, 0.30 * (outcome.tir - 0.72))
+
+    # ── Restorative sleep improves next-day regulation ──
+    if outcome.sleep_minutes > 450:
+        mods["stress_add"] = mods.get("stress_add", 0.0) - min(0.05, (outcome.sleep_minutes - 450) / 2400.0)
+        mods["exercise_prob_mult"] = max(mods.get("exercise_prob_mult", 1.0), 1.05)
+
     # ── Exercise avoidance from fatigue ──
     bad_sleep = outcome.sleep_minutes < 300  # < 5 hours
     bad_bg = outcome.mean_bg > 200
@@ -146,6 +157,11 @@ def apply_daily_feedback(
         mods["stress_add"] = mods.get("stress_add", 0.0) + min(
             0.15, 0.03 * outcome.consecutive_bad_days
         )
+
+    # ── Stable stretches make future good days more likely ──
+    if outcome.consecutive_bad_days == 0 and outcome.tir > 0.80 and outcome.percent_low < 0.02:
+        mods["mood_bias"] = mods.get("mood_bias", 0.0) + 0.08
+        mods["stress_add"] = mods.get("stress_add", 0.0) - 0.03
 
     return mods
 
@@ -274,6 +290,7 @@ class EventType(Enum):
     INSOMNIA_BOUT = "insomnia_bout"
     ILLNESS = "illness"
     ACUTE_STRESS = "acute_stress"
+    POSITIVE_LIFE_EVENT = "positive_life_event"
     TRAVEL = "travel"
     MENSTRUAL_IRREGULARITY = "menstrual_irregularity"
     INJURY = "injury"
@@ -323,6 +340,7 @@ _EVENT_CATALOG = {
     EventType.INSOMNIA_BOUT:         (0.25, (3, 10),  0.30, False),
     EventType.ILLNESS:               (0.40, (3, 7),   0.40, True),
     EventType.ACUTE_STRESS:          (0.15, (14, 45),  0.50, True),
+    EventType.POSITIVE_LIFE_EVENT:   (0.28, (4, 12),  0.25, False),
     EventType.TRAVEL:                (0.30, (5, 14),  0.30, False),
     EventType.MENSTRUAL_IRREGULARITY:(0.20, (28, 56), 0.20, False),
     EventType.INJURY:                (0.10, (14, 42),  0.40, True),
@@ -410,6 +428,14 @@ def _sample_event_params(
         return {
             "sleep_reduction_frac": float(rng.uniform(0.30, 0.50)),
             "efficiency_penalty": float(rng.uniform(0.15, 0.25)),
+        }
+    elif etype == EventType.POSITIVE_LIFE_EVENT:
+        return {
+            "stress_relief": float(rng.uniform(0.05, 0.14)),
+            "mood_offset": float(rng.uniform(0.12, 0.28)),
+            "exercise_prob_mult": float(rng.uniform(1.05, 1.20)),
+            "meal_regularity_boost": float(rng.uniform(0.05, 0.12)),
+            "logging_quality_mult": float(rng.uniform(1.05, 1.20)),
         }
     elif etype == EventType.ILLNESS:
         return {
@@ -703,6 +729,13 @@ def apply_event_modifiers(
             mods["exercise_prob_mult"] *= p.get("exercise_prob_mult", 0.6)
             mods["meal_regularity_add"] -= p.get("meal_regularity_drop", 0.20) * intensity
 
+        elif ev.event_type == EventType.POSITIVE_LIFE_EVENT:
+            mods["stress_add"] -= p.get("stress_relief", 0.10) * intensity
+            mods["mood_offset"] += p.get("mood_offset", 0.18) * intensity
+            mods["exercise_prob_mult"] *= p.get("exercise_prob_mult", 1.10)
+            mods["meal_regularity_add"] += p.get("meal_regularity_boost", 0.08) * intensity
+            mods["logging_quality_mult"] *= p.get("logging_quality_mult", 1.10)
+
         elif ev.event_type == EventType.TRAVEL:
             shift = p.get("timezone_shift_h", 3.0)
             # Jet lag recovery: 1 day per hour of offset
@@ -763,7 +796,7 @@ def apply_event_modifiers(
     mods["meal_size_mult"] = float(np.clip(mods["meal_size_mult"], 0.5, 2.0))
     mods["isf_mult_factor"] = float(np.clip(mods["isf_mult_factor"], 0.5, 1.5))
     mods["egp_mult"] = float(np.clip(mods["egp_mult"], 0.8, 2.0))
-    mods["stress_add"] = float(np.clip(mods["stress_add"], 0.0, 0.50))
+    mods["stress_add"] = float(np.clip(mods["stress_add"], -0.20, 0.50))
     mods["mood_offset"] = float(np.clip(mods["mood_offset"], -0.60, 0.20))
 
     return mods

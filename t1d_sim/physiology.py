@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING
 import numpy as np
 
 from t1d_sim.behavior import ContextState
+from t1d_sim.therapy import TherapySchedule
 
 if TYPE_CHECKING:
     from t1d_sim.feedback import PatientState
@@ -157,7 +158,13 @@ def apply_context_effectors(
     return params
 
 
-def simulate_day_cgm(base_params: dict, modified_params: dict, meals: list[tuple], seed: int) -> np.ndarray:
+def simulate_day_cgm(
+    base_params: dict,
+    modified_params: dict,
+    meals: list[tuple],
+    seed: int,
+    therapy_schedule: TherapySchedule | None = None,
+) -> np.ndarray:
     """Generate 288 five-minute BG points in mg/dL."""
     rng = np.random.default_rng(seed)
     bg = np.zeros(288, dtype=float)
@@ -173,7 +180,22 @@ def simulate_day_cgm(base_params: dict, modified_params: dict, meals: list[tuple
             meal_effect[idx:end] += carbs * kernel[:window] * 9.0
     sens = modified_params["k1"] / max(1e-6, base_params["k1"])
     egp = modified_params["EGP0"] / max(1e-6, base_params["EGP0"])
+    mean_isf = therapy_schedule.weighted_mean("isf") if therapy_schedule is not None else None
+    mean_cr = therapy_schedule.weighted_mean("cr") if therapy_schedule is not None else None
+    mean_basal = therapy_schedule.weighted_mean("basal") if therapy_schedule is not None else None
     for i in range(1, 288):
-        drift = (egp - 1.0) * 1.8 - (sens - 1.0) * 1.2
-        bg[i] = max(45.0, min(450.0, bg[i-1] + 0.06 * meal_effect[i] + drift + rng.normal(0, 2.8)))
+        local_sens = sens
+        local_egp = egp
+        local_meal_effect = meal_effect[i]
+        if therapy_schedule is not None and mean_isf and mean_cr and mean_basal:
+            seg = therapy_schedule.value_at_minute(i * 5)
+            isf_factor = np.clip(mean_isf / max(seg.isf, 1e-6), 0.75, 1.25)
+            cr_factor = np.clip(mean_cr / max(seg.cr, 1e-6), 0.75, 1.25)
+            basal_factor = np.clip(seg.basal / max(mean_basal, 1e-6), 0.75, 1.25)
+            local_sens *= isf_factor
+            local_meal_effect *= cr_factor
+            local_egp *= 1.0 / basal_factor
+
+        drift = (local_egp - 1.0) * 1.8 - (local_sens - 1.0) * 1.2
+        bg[i] = max(45.0, min(450.0, bg[i-1] + 0.06 * local_meal_effect + drift + rng.normal(0, 2.8)))
     return bg

@@ -3,10 +3,8 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from multiprocessing import Pool
-import pandas as pd
-from tqdm import tqdm
 
-from t1d_sim.features import build_feature_frames
+from t1d_sim.feature_frame import FeatureFrameHourly
 from t1d_sim.patient import simulate_patient
 from t1d_sim.patient_threephase import simulate_patient_threephase, PhaseConfig
 from t1d_sim.population import sample_population, PatientConfig
@@ -17,6 +15,14 @@ from t1d_sim.questionnaire import (
     sample_twins_from_priors,
     physical_priors_from_twins,
 )
+from t1d_sim.therapy import (
+    TherapySegment,
+    TherapySchedule,
+    SegmentDelta,
+    StructureEdit,
+    make_default_schedule,
+)
+from t1d_sim.simulate import DailySimResult, SimulationCarryState, simulate_day
 from t1d_sim.writers import SQLiteWriter, FirebaseWriter
 
 
@@ -61,6 +67,9 @@ def simulate_population(
         phase_cfg:        PhaseConfig for closed-loop mode.
         recommender:      PredictorCard for closed-loop recommendations.
     """
+    import pandas as pd  # noqa: F401  # imported lazily for environments that only need core simulation APIs
+    from tqdm import tqdm
+
     patients = sample_population(n_patients, seed=seed, male_fraction=male_fraction, aid_fraction=aid_fraction)
     train, val, test = [int(x) for x in split.split("/")]
     cuts = [n_patients * train // 100, n_patients * (train + val) // 100]
@@ -80,6 +89,8 @@ def simulate_population(
 
 def _run_open_loop(patients, days, start, writer, outdb, jobs):
     """Original open-loop simulation pipeline."""
+    from tqdm import tqdm
+
     tasks = [(p, days, start) for p in patients]
     results = []
     if jobs > 1:
@@ -99,6 +110,8 @@ def _run_open_loop(patients, days, start, writer, outdb, jobs):
 
 def _run_closed_loop(patients, days, start, writer, outdb, jobs, phase_cfg, recommender):
     """Three-phase closed-loop simulation with fork branching."""
+    from tqdm import tqdm
+
     if phase_cfg is None:
         phase_cfg = PhaseConfig(total_days=days)
 
@@ -141,6 +154,9 @@ def _run_closed_loop(patients, days, start, writer, outdb, jobs, phase_cfg, reco
 
 def _write_feature_frames(writer, results):
     """Compute and write feature frames from simulation results."""
+    import pandas as pd
+    from t1d_sim.features import build_feature_frames
+
     raw = writer.raw_for_features()
     rdf = pd.DataFrame(raw, columns=[
         "user_id", "hour_utc", "avg_bg", "percent_low", "percent_high",

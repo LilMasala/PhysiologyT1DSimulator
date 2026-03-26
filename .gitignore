@@ -9,3 +9,5 @@ zoo_v2/
 zoo_v3/
 *.pkl
 *.docx
+scripts/local_runs/
+scripts/reports/

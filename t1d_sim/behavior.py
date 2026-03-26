@@ -98,9 +98,9 @@ def generate_day_behavior(
     sleep_eff = float(np.clip(sleep_eff, 0.40, 0.97))
 
     # ── Stress ──
-    stress = max(eff_stress_baseline, float(np.clip(
+    stress = float(np.clip(
         rng.normal(eff_stress_baseline + 0.12 * (1 - cfg.mood_stability), 0.15), 0, 1,
-    )))
+    ))
     stress += fb.get("stress_add", 0.0) + ev.get("stress_add", 0.0)
     stress = float(np.clip(stress, 0.0, 1.0))
 
@@ -121,6 +121,12 @@ def generate_day_behavior(
         0.7 * prev_a + rng.normal(0, 0.4 * (1 - cfg.mood_stability)) + 0.25 * stress,
         -1, 1,
     ))
+    if sleep_min >= 420:
+        v += min(0.12, (sleep_min - 420) / 1500.0)
+        a -= min(0.08, (sleep_min - 420) / 1800.0)
+    if exercise_today and ex_minutes > 0:
+        v += min(0.14, ex_minutes / 500.0)
+        a += min(0.06, ex_intensity * 0.08)
     if phase == "luteal":
         v -= cfg.luteal_mood_drop
     v += fb.get("mood_bias", 0.0) + ev.get("mood_offset", 0.0)

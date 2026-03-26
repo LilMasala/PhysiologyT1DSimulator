@@ -9,6 +9,7 @@ from t1d_sim.agency import UserAgencyProfile, sample_agency
 from t1d_sim.constants import PERSONAS
 from t1d_sim.feedback import EventSchedule, sample_life_events
 from t1d_sim.missingness import MissingnessProfile, make_missingness_profile
+from t1d_sim.therapy import TherapySchedule, make_default_schedule
 
 try:
     from chamelia.personality import UserPersonality, sample_personality
@@ -54,6 +55,8 @@ class PatientConfig:
     missingness_profile: MissingnessProfile | None = None
     agency_profile: UserAgencyProfile | None = None
     event_schedule: EventSchedule | None = None
+    baseline_therapy_schedule: TherapySchedule | None = None
+    therapy_schedule: TherapySchedule | None = None
     personality: "UserPersonality | None" = None
 
     @property
@@ -68,7 +71,14 @@ class PatientConfig:
 
     def to_record(self) -> dict:
         d = {k: v for k, v in asdict(self).items()
-             if k not in ("missingness_profile", "agency_profile", "event_schedule", "personality")}
+             if k not in (
+                 "missingness_profile",
+                 "agency_profile",
+                 "event_schedule",
+                 "baseline_therapy_schedule",
+                 "therapy_schedule",
+                 "personality",
+             )}
         d["logging_quality"] = self.logging_quality
         return d
 
@@ -131,6 +141,8 @@ def sample_population(n_patients: int, seed: int = 42, male_fraction: float = 0.
         miss_rng = np.random.default_rng(int(rng.integers(0, 1_000_000)))
         cfg.missingness_profile = make_missingness_profile(cfg.logging_quality_raw, miss_rng)
         cfg = apply_cross_parameter_interactions(cfg)
+        cfg.baseline_therapy_schedule = make_default_schedule(cfg)
+        cfg.therapy_schedule = copy.deepcopy(cfg.baseline_therapy_schedule)
         agency_rng = np.random.default_rng(int(rng.integers(0, 1_000_000)))
         cfg.agency_profile = sample_agency(cfg, agency_rng)
         event_rng = np.random.default_rng(int(rng.integers(0, 1_000_000)))
